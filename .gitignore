@@ -1,0 +1,9 @@
+build/
+build-*/
+external/
+.cache/
+.vscode/
+.idea/
+compile_commands.json
+*.swp
+.DS_Store
