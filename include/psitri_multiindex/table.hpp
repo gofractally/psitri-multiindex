@@ -254,36 +254,7 @@ namespace psitri_multiindex
       // for multi-row work, but a single `put` is self-atomic on its own.
       void put(const T& row)
       {
-         const auto pk_value = detail::invoke_extractor<Primary::extractor>(row);
-         auto       pk_bytes = encode_primary_key(prefix_view(), pk_value);
-
-         auto       existing_raw =
-             _tx->template get<std::string>(detail::key_view_of(pk_bytes));
-         const bool was_insert = !existing_raw.has_value();
-
-         if constexpr (num_secondaries > 0)
-         {
-            constexpr auto seq = std::make_index_sequence<num_secondaries>{};
-            if (existing_raw)
-            {
-               T old_row = psio::decode<T>(
-                   psio::pssz{}, std::span<const char>(existing_raw->data(),
-                                                       existing_raw->size()));
-               // Phase 1: validate (no writes).
-               validate_secondaries_diff(old_row, row, pk_bytes, seq);
-               // Phase 2: apply.
-               apply_secondaries_diff(old_row, row, pk_bytes, seq);
-            }
-            else
-            {
-               validate_all_secondaries(row, pk_bytes, seq);
-               apply_all_secondaries(row, pk_bytes, seq);
-            }
-         }
-
-         auto packed = psio::encode(psio::pssz{}, row);
-         _tx->upsert(detail::key_view_of(pk_bytes), detail::value_view_of(packed));
-
+         const bool was_insert = put_impl(row);
          if (was_insert && _track_row_count)
          {
             auto h = read_header();
@@ -300,6 +271,11 @@ namespace psitri_multiindex
       // Requires the primary extractor to be a member-pointer-to-data so
       // we can write the assigned id back into the row before encoding.
       // Compile error if the primary is a member function or composite key.
+      //
+      // Header writes: a single combined write at the end of the call
+      // updates both `next_id` and (if enabled) `row_count`. If put_impl
+      // throws, the header is untouched so an aborted tx winds back
+      // cleanly to the pre-call state.
       template <typename Row = T>
       auto insert(Row row) -> primary_key_type
       {
@@ -309,15 +285,18 @@ namespace psitri_multiindex
              "data-member pointer (so the auto-allocated id can be assigned "
              "back into the row before write)");
 
-         auto h     = read_header();
-         auto id    = h.next_id;
+         auto h  = read_header();
+         auto id = h.next_id;
          row.*Primary::extractor = static_cast<primary_key_type>(id);
-         h.next_id  = id + 1;
-         // Row-count bookkeeping is handled by put() below to avoid
-         // double-counting; we only bump next_id here.
-         write_header(h);
 
-         put(row);
+         // Validate + apply the row first; a collision throws here before
+         // we touch the header.
+         (void)put_impl(row);
+
+         h.next_id = id + 1;
+         if (_track_row_count && h.row_count.has_value())
+            h.row_count = *h.row_count + 1;
+         write_header(h);
          return static_cast<primary_key_type>(id);
       }
 
@@ -806,6 +785,28 @@ namespace psitri_multiindex
             return std::string_view(k.data(), k.size());
          }
 
+         // Re-position this iterator to the first secondary entry whose
+         // key is ≥ encode(prefix||idx||key_value). The stop_prefix is
+         // widened to the whole-tag bound so seek may walk into adjacent
+         // sk values; if you need to clamp to a single sk value, use
+         // `equal_range<Tag>(key_value)` instead.
+         template <typename K>
+         secondary_iterator& seek(const K& key_value)
+         {
+            constexpr std::size_t one_based =
+                table::template find_index_by_tag<Tag>::position;
+            auto k = encode_secondary_key(_table->prefix_view(), one_based,
+                                          key_value);
+            // Loosen the stop bound to the entire tag; the original
+            // stop_prefix may have been a per-(sk) clamp from equal_range.
+            _stop_prefix = encode_index_prefix(
+                _table->prefix_view(), prefix_byte_for_index(one_based));
+            _cur.lower_bound(detail::key_view_of(k));
+            _at_end = false;
+            check_in_range();
+            return *this;
+         }
+
         private:
          void check_in_range()
          {
@@ -989,6 +990,46 @@ namespace psitri_multiindex
          // not the per-field decode.
          (void)view;
          return encode_secondary_for_row<I>(tmp_for_pk);
+      }
+
+      // ── Core upsert (without header / row_count maintenance) ─────────
+      //
+      // Returns true if the row was a fresh insert, false if it replaced
+      // an existing primary. Throws secondary_collision before any tree
+      // write if a unique-secondary check fails.
+
+      bool put_impl(const T& row)
+      {
+         const auto pk_value =
+             detail::invoke_extractor<Primary::extractor>(row);
+         auto pk_bytes = encode_primary_key(prefix_view(), pk_value);
+
+         auto       existing_raw =
+             _tx->template get<std::string>(detail::key_view_of(pk_bytes));
+         const bool was_insert = !existing_raw.has_value();
+
+         if constexpr (num_secondaries > 0)
+         {
+            constexpr auto seq = std::make_index_sequence<num_secondaries>{};
+            if (existing_raw)
+            {
+               T old_row = psio::decode<T>(
+                   psio::pssz{}, std::span<const char>(existing_raw->data(),
+                                                       existing_raw->size()));
+               validate_secondaries_diff(old_row, row, pk_bytes, seq);
+               apply_secondaries_diff(old_row, row, pk_bytes, seq);
+            }
+            else
+            {
+               validate_all_secondaries(row, pk_bytes, seq);
+               apply_all_secondaries(row, pk_bytes, seq);
+            }
+         }
+
+         auto packed = psio::encode(psio::pssz{}, row);
+         _tx->upsert(detail::key_view_of(pk_bytes),
+                     detail::value_view_of(packed));
+         return was_insert;
       }
 
       // ── Validation (read-only; throws before any tree write) ─────────

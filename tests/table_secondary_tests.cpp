@@ -457,6 +457,44 @@ TEST_CASE("tag-iter: equal_range<Tag> on a unique secondary returns 0 or 1",
    tx.commit();
 }
 
+TEST_CASE("tag-iter: secondary_iterator::seek re-positions within a tag",
+          "[table][secondary][tag-iter][seek]")
+{
+   fixture     f;
+   auto        tx = f.ws->start_transaction(0);
+   users_table users(tx, "U/");
+
+   users.put(PmidxUser{1, "alice", 100});
+   users.put(PmidxUser{2, "bob",   100});
+   users.put(PmidxUser{3, "carol", 200});
+   users.put(PmidxUser{4, "dave",  100});
+   users.put(PmidxUser{5, "eve",   300});
+
+   // Seek over a unique secondary.
+   {
+      auto it = users.begin<by_name>();
+      REQUIRE((*it).name == "alice");
+      it.seek(std::string("carol"));
+      REQUIRE((*it).name == "carol");
+      it.seek(std::string("zz"));
+      REQUIRE(it == users.end<by_name>());
+   }
+
+   // Seek over a non-unique secondary; jumps across (sk, *) blocks.
+   {
+      auto it = users.begin<by_group>();
+      REQUIRE((*it).group_id == 100);  // first row in group=100 block
+      it.seek(std::uint64_t{200});
+      REQUIRE((*it).group_id == 200);
+      it.seek(std::uint64_t{150});     // first row with group >= 150 → 200
+      REQUIRE((*it).group_id == 200);
+      it.seek(std::uint64_t{999});
+      REQUIRE(it == users.end<by_group>());
+   }
+
+   tx.commit();
+}
+
 TEST_CASE("tag-iter: contains<Tag> probes without decoding the row",
           "[table][secondary][tag-iter][contains]")
 {

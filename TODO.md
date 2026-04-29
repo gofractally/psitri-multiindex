@@ -39,10 +39,16 @@ commit in the relevant doc / changelog instead of leaving a "[done]" stub.
 
 ## API surface
 
-- `iterator::seek(k)` exists for the primary iterator only. The
-  secondary `secondary_iterator<Tag>` would benefit from an analogous
-  `seek(k)` for re-positioning within a tag without constructing a
-  fresh cursor.
+- **`psio::key` digest support (Spring/Antelope blocker).** `psio::key`
+  doesn't dispatch on `std::array<uint8_t, N>`, so 32-byte digest types
+  (`fc::sha256`, `transaction_id_type`, `digest_type`, `block_id_type`)
+  can't be used as keys without wrapping them as a record of two
+  `psio::uint128` halves. Upstream psio change: add a `std::array`
+  branch to `encode_value` (and decoder).
+- **`psio::key` long-double / float128 support.** `psio::key` handles
+  `float` and `double` (sign-flipped BE, matches IEEE 754). 128-bit
+  float (Spring's `index_long_double_index`) is unsupported. Upstream
+  psio change.
 
 ## Performance / fast paths
 
@@ -56,9 +62,11 @@ commit in the relevant doc / changelog instead of leaving a "[done]" stub.
   default for record types whose `effective_max_dynamic_v<T>` is
   known-bounded — those decode straight from the segment without a
   copy regardless.
-- **Header rewrites on every `insert()`** (next_id changes) and on
-  every mutation when `track_row_count` is on. Lazy / batched header
-  flush at tx commit would save N-1 header writes per tx.
+- **Header rewrites on every mutation when `track_row_count` is on.**
+  `insert()` already collapses the next_id + row_count bump into one
+  header write; `put()` and `erase()` still write per call. Batched /
+  end-of-tx flush would save N-1 header writes per tx of the same
+  kind.
 
 ## Build / packaging
 
@@ -77,15 +85,12 @@ commit in the relevant doc / changelog instead of leaving a "[done]" stub.
 
 ## Docs
 
-- **README is empty-ish.** Add a quickstart: declare row + named tags,
-  construct table, insert/get/iter, sub-tx pattern, the `value_pin`
-  zero-copy idiom.
-- **API reference.** A single `class table<...>` synopsis with
-  preconditions, complexity, and exception spec for each method.
 - **Schema-validation guide.** Lands with the schema_hash work.
-- **Ordering rules.** `psio::key` encoding semantics for the types we
-  actually use (uints, strings, optional, tuple). Big-endian-int
-  policy. The "what makes a key memcmp-sortable" rules.
+- **Ordering rules deep-dive.** `psio::key` encoding semantics for the
+  types we actually use (uints, strings, optional, tuple, float/double,
+  uint128/256). Big-endian-int policy. "What makes a key memcmp-
+  sortable" rules. Today scattered across `docs/api.md` §1 and
+  `tests/key_codec_tests.cpp`; gather into a single doc.
 
 ## Parking lot — open design questions
 
