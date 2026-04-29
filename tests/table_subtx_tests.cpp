@@ -16,21 +16,23 @@
 
 using namespace psitri_multiindex;
 
+struct PmidxRowA
+{
+   std::uint64_t id;
+   std::string   name;
+};
+PSIO_REFLECT(PmidxRowA, id, name)
+
+struct PmidxRowB
+{
+   std::uint64_t id;
+   std::uint64_t balance;
+};
+PSIO_REFLECT(PmidxRowB, id, balance)
+
 namespace pmidx_subtx_test
 {
-   struct row_a
-   {
-      std::uint64_t id;
-      std::string   name;
-   };
-   PSIO_REFLECT(row_a, id, name)
-
-   struct row_b
-   {
-      std::uint64_t id;
-      std::uint64_t balance;
-   };
-   PSIO_REFLECT(row_b, id, balance)
+   struct by_id;
 
    struct fixture
    {
@@ -51,13 +53,11 @@ namespace pmidx_subtx_test
       ~fixture() { std::error_code ec; std::filesystem::remove_all(dir, ec); }
    };
 
-   using table_a = table<row_a, &row_a::id>;
-   using table_b = table<row_b, &row_b::id>;
+   using table_a = table<PmidxRowA, ordered_unique<by_id, &PmidxRowA::id>>;
+   using table_b = table<PmidxRowB, ordered_unique<by_id, &PmidxRowB::id>>;
 }  // namespace pmidx_subtx_test
 
 using pmidx_subtx_test::fixture;
-using pmidx_subtx_test::row_a;
-using pmidx_subtx_test::row_b;
 using pmidx_subtx_test::table_a;
 using pmidx_subtx_test::table_b;
 
@@ -70,7 +70,7 @@ TEST_CASE("subtx: commit makes writes visible to enclosing tx",
 
    {
       auto sub = tx.sub_transaction();
-      t.put(row_a{1, "alice"});
+      t.put(PmidxRowA{1, "alice"});
       sub.commit();
    }
 
@@ -87,15 +87,14 @@ TEST_CASE("subtx: abort rolls back writes from same sub", "[table][subtx]")
    auto    tx = f.ws->start_transaction(0);
    table_a t(tx, "A/");
 
-   t.put(row_a{1, "v0"});
+   t.put(PmidxRowA{1, "v0"});
 
    {
       auto sub = tx.sub_transaction();
-      t.put(row_a{1, "v1"});
+      t.put(PmidxRowA{1, "v1"});
       sub.abort();
    }
 
-   // After abort, the row should be back at v0.
    auto v = t.get(std::uint64_t{1});
    REQUIRE(v.has_value());
    REQUIRE(v->name == "v0");
@@ -111,7 +110,7 @@ TEST_CASE("subtx: abort discards inserts from same sub", "[table][subtx]")
 
    {
       auto sub = tx.sub_transaction();
-      t.put(row_a{99, "ephemeral"});
+      t.put(PmidxRowA{99, "ephemeral"});
       sub.abort();
    }
    REQUIRE_FALSE(t.contains(std::uint64_t{99}));
@@ -126,13 +125,13 @@ TEST_CASE("subtx: abort is atomic across two tables sharing the tx",
    table_a ta(tx, "A/");
    table_b tb(tx, "B/");
 
-   ta.put(row_a{1, "alice"});
-   tb.put(row_b{1, 100});
+   ta.put(PmidxRowA{1, "alice"});
+   tb.put(PmidxRowB{1, 100});
 
    {
       auto sub = tx.sub_transaction();
-      ta.put(row_a{1, "ALICE_NEW"});
-      tb.put(row_b{1, 999});
+      ta.put(PmidxRowA{1, "ALICE_NEW"});
+      tb.put(PmidxRowB{1, 999});
       sub.abort();
    }
 
@@ -152,23 +151,23 @@ TEST_CASE("subtx: nested subs LIFO commit/abort", "[table][subtx]")
    auto    tx = f.ws->start_transaction(0);
    table_a t(tx, "A/");
 
-   t.put(row_a{1, "v0"});
+   t.put(PmidxRowA{1, "v0"});
 
    {
       auto outer = tx.sub_transaction();
-      t.put(row_a{1, "v1"});
+      t.put(PmidxRowA{1, "v1"});
 
       {
          auto inner = tx.sub_transaction();
-         t.put(row_a{1, "v2"});
-         inner.abort();   // discards v2, exposes v1 to outer
+         t.put(PmidxRowA{1, "v2"});
+         inner.abort();
       }
 
       auto v = t.get(std::uint64_t{1});
       REQUIRE(v.has_value());
       REQUIRE(v->name == "v1");
 
-      outer.commit();      // merges v1 into the parent tx
+      outer.commit();
    }
 
    auto v = t.get(std::uint64_t{1});
@@ -181,16 +180,13 @@ TEST_CASE("subtx: nested subs LIFO commit/abort", "[table][subtx]")
 TEST_CASE("subtx: large-value abort rollback (regression for value_node bug)",
           "[table][subtx]")
 {
-   // Mirrors the spring ram_tests scenario that uncovered the abort_frame
-   // value_node bug we fixed. Confirm the fix is in psitri main and reaches
-   // through to the table layer.
    fixture f;
 
    {
       auto    tx = f.ws->start_transaction(0);
       table_a t(tx, "A/");
       for (std::uint64_t k = 1; k <= 10; ++k)
-         t.put(row_a{k, std::string(1780, 'a')});
+         t.put(PmidxRowA{k, std::string(1780, 'a')});
       tx.commit();
    }
 
@@ -200,7 +196,7 @@ TEST_CASE("subtx: large-value abort rollback (regression for value_node bug)",
       {
          auto sub = tx.sub_transaction();
          for (std::uint64_t k = 1; k <= 10; ++k)
-            t.put(row_a{k, std::string(1790, 'b')});
+            t.put(PmidxRowA{k, std::string(1790, 'b')});
          sub.abort();
       }
 

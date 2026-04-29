@@ -13,18 +13,23 @@
 #include <filesystem>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 using namespace psitri_multiindex;
 
+struct PmidxUser
+{
+   std::uint64_t id;        // primary
+   std::string   name;      // unique secondary
+   std::uint64_t group_id;  // non-unique secondary
+};
+PSIO_REFLECT(PmidxUser, id, name, group_id)
+
 namespace pmidx_sec_test
 {
-   struct user
-   {
-      std::uint64_t id;          // primary
-      std::string   name;        // secondary 1 (unique)
-      std::uint64_t group_id;    // secondary 2 (non-unique → composite with id)
-   };
-   PSIO_REFLECT(user, id, name, group_id)
+   struct by_id;
+   struct by_name;
+   struct by_group;
 
    struct fixture
    {
@@ -45,28 +50,30 @@ namespace pmidx_sec_test
       ~fixture() { std::error_code ec; std::filesystem::remove_all(dir, ec); }
    };
 
-   using users_table = table<user,
-                             /*primary  */ &user::id,
-                             /*secondary*/ &user::name,
-                             /*secondary*/ composite_key<&user::group_id, &user::id>{}>;
+   using users_table = table<PmidxUser,
+                             ordered_unique<by_id,    &PmidxUser::id>,
+                             ordered_unique<by_name,  &PmidxUser::name>,
+                             ordered_non_unique<by_group, &PmidxUser::group_id>>;
 }  // namespace pmidx_sec_test
 
+using pmidx_sec_test::by_group;
+using pmidx_sec_test::by_id;
+using pmidx_sec_test::by_name;
 using pmidx_sec_test::fixture;
-using pmidx_sec_test::user;
 using pmidx_sec_test::users_table;
 
-TEST_CASE("secondary: lookup by unique name returns the row",
-          "[table][secondary]")
+TEST_CASE("named-tag: find<by_name> on a unique secondary",
+          "[table][secondary][named-tag]")
 {
    fixture f;
    auto    tx = f.ws->start_transaction(0);
    users_table users(tx, "U/");
 
-   users.put(user{1, "alice", 100});
-   users.put(user{2, "bob", 100});
-   users.put(user{3, "carol", 200});
+   users.put(PmidxUser{1, "alice", 100});
+   users.put(PmidxUser{2, "bob",   100});
+   users.put(PmidxUser{3, "carol", 200});
 
-   auto v = users.get_by_secondary<1>(std::string("bob"));
+   auto v = users.find<by_name>(std::string("bob"));
    REQUIRE(v.has_value());
    REQUIRE(v->id == 2);
    REQUIRE(v->name == "bob");
@@ -74,103 +81,179 @@ TEST_CASE("secondary: lookup by unique name returns the row",
    tx.commit();
 }
 
-TEST_CASE("secondary: lookup by missing key returns nullopt",
-          "[table][secondary]")
+TEST_CASE("named-tag: find<by_name> on missing key returns nullopt",
+          "[table][secondary][named-tag]")
 {
-   fixture f;
-   auto    tx = f.ws->start_transaction(0);
+   fixture     f;
+   auto        tx = f.ws->start_transaction(0);
    users_table users(tx, "U/");
-   users.put(user{1, "alice", 100});
-   REQUIRE_FALSE(users.get_by_secondary<1>(std::string("nonexistent")).has_value());
+   users.put(PmidxUser{1, "alice", 100});
+   REQUIRE_FALSE(users.find<by_name>(std::string("nonexistent")).has_value());
    tx.commit();
 }
 
-TEST_CASE("secondary: replace updates the secondary index",
-          "[table][secondary]")
+TEST_CASE("named-tag: replace updates the secondary index",
+          "[table][secondary][named-tag]")
 {
-   fixture f;
-   auto    tx = f.ws->start_transaction(0);
+   fixture     f;
+   auto        tx = f.ws->start_transaction(0);
    users_table users(tx, "U/");
 
-   users.put(user{1, "alice", 100});
-   users.put(user{1, "alice2", 100});  // rename
+   users.put(PmidxUser{1, "alice", 100});
+   users.put(PmidxUser{1, "alice2", 100});  // rename
 
-   // Old name should no longer find the row.
-   REQUIRE_FALSE(users.get_by_secondary<1>(std::string("alice")).has_value());
-   // New name should.
-   auto v = users.get_by_secondary<1>(std::string("alice2"));
+   REQUIRE_FALSE(users.find<by_name>(std::string("alice")).has_value());
+   auto v = users.find<by_name>(std::string("alice2"));
    REQUIRE(v.has_value());
    REQUIRE(v->id == 1);
 
    tx.commit();
 }
 
-TEST_CASE("secondary: erase clears all secondary entries",
-          "[table][secondary]")
+TEST_CASE("named-tag: erase clears all secondary entries",
+          "[table][secondary][named-tag]")
 {
-   fixture f;
-   auto    tx = f.ws->start_transaction(0);
+   fixture     f;
+   auto        tx = f.ws->start_transaction(0);
    users_table users(tx, "U/");
 
-   users.put(user{1, "alice", 100});
-   REQUIRE(users.get_by_secondary<1>(std::string("alice")).has_value());
+   users.put(PmidxUser{1, "alice", 100});
+   REQUIRE(users.find<by_name>(std::string("alice")).has_value());
 
    users.erase(std::uint64_t{1});
-   REQUIRE_FALSE(users.get_by_secondary<1>(std::string("alice")).has_value());
+   REQUIRE_FALSE(users.find<by_name>(std::string("alice")).has_value());
 
    tx.commit();
 }
 
-TEST_CASE("secondary: composite key supports same value across rows",
-          "[table][secondary][composite]")
+TEST_CASE("ordered_non_unique<by_group>: equal_range yields all matching rows",
+          "[table][secondary][non-unique]")
 {
-   // group_id alone is not unique (two users in group 100), so the secondary
-   // is declared as composite_key<group_id, id> — the trailing id makes
-   // every secondary key unique by construction.
-   fixture f;
-   auto    tx = f.ws->start_transaction(0);
+   fixture     f;
+   auto        tx = f.ws->start_transaction(0);
    users_table users(tx, "U/");
 
-   users.put(user{1, "alice", 100});
-   users.put(user{2, "bob",   100});
-   users.put(user{3, "carol", 200});
+   users.put(PmidxUser{1, "alice", 100});
+   users.put(PmidxUser{2, "bob",   100});
+   users.put(PmidxUser{3, "carol", 200});
+   users.put(PmidxUser{4, "dave",  100});
 
-   // get_by_secondary<2> with full composite (group_id, id) finds the exact row.
-   auto v = users.get_by_secondary<2>(std::make_tuple(std::uint64_t{100},
-                                                      std::uint64_t{2}));
+   std::vector<std::uint64_t> in_group_100;
+   for (auto&& u : users.equal_range<by_group>(std::uint64_t{100}))
+      in_group_100.push_back(u.id);
+
+   // (group, id) tree order → ids 1, 2, 4 in ascending order.
+   REQUIRE(in_group_100 == std::vector<std::uint64_t>{1, 2, 4});
+
+   std::vector<std::uint64_t> in_group_200;
+   for (auto&& u : users.equal_range<by_group>(std::uint64_t{200}))
+      in_group_200.push_back(u.id);
+   REQUIRE(in_group_200 == std::vector<std::uint64_t>{3});
+
+   std::vector<std::uint64_t> in_group_999;
+   for (auto&& u : users.equal_range<by_group>(std::uint64_t{999}))
+      in_group_999.push_back(u.id);
+   REQUIRE(in_group_999.empty());
+
+   tx.commit();
+}
+
+TEST_CASE("ordered_non_unique<by_group>: find returns first matching row",
+          "[table][secondary][non-unique]")
+{
+   fixture     f;
+   auto        tx = f.ws->start_transaction(0);
+   users_table users(tx, "U/");
+
+   users.put(PmidxUser{5, "eve",   100});
+   users.put(PmidxUser{1, "alice", 100});
+   users.put(PmidxUser{3, "carol", 100});
+
+   auto v = users.find<by_group>(std::uint64_t{100});
    REQUIRE(v.has_value());
-   REQUIRE(v->name == "bob");
-
-   // A different (group_id, id) tuple finds the other row in the group.
-   auto w = users.get_by_secondary<2>(std::make_tuple(std::uint64_t{100},
-                                                      std::uint64_t{1}));
-   REQUIRE(w.has_value());
-   REQUIRE(w->name == "alice");
+   REQUIRE(v->id == 1);  // ids 1, 3, 5 in tree order — lowest pk wins
 
    tx.commit();
 }
 
-TEST_CASE("secondary: subtx abort restores secondary indexes too",
-          "[table][secondary][subtx]")
+TEST_CASE("ordered_unique<by_name>: collision rejected",
+          "[table][secondary][unique][collision]")
 {
-   fixture f;
-   auto    tx = f.ws->start_transaction(0);
+   fixture     f;
+   auto        tx = f.ws->start_transaction(0);
    users_table users(tx, "U/");
 
-   users.put(user{1, "alice", 100});
-   {
-      auto sub = tx.sub_transaction();
-      users.put(user{1, "alice2", 100});
-      sub.abort();
-   }
+   users.put(PmidxUser{1, "alice", 100});
 
-   // Both primary AND the secondary entry must be back at the pre-sub state.
-   auto v = users.get(std::uint64_t{1});
+   // Different primary, same unique secondary — must throw.
+   REQUIRE_THROWS_AS(
+       users.put(PmidxUser{2, "alice", 200}),
+       psitri_multiindex::secondary_collision);
+
+   // First row is intact.
+   auto v = users.find<by_id>(std::uint64_t{1});
    REQUIRE(v.has_value());
    REQUIRE(v->name == "alice");
 
-   REQUIRE(users.get_by_secondary<1>(std::string("alice")).has_value());
-   REQUIRE_FALSE(users.get_by_secondary<1>(std::string("alice2")).has_value());
+   tx.commit();
+}
+
+TEST_CASE("ordered_unique<by_name>: same-pk re-put is fine",
+          "[table][secondary][unique]")
+{
+   fixture     f;
+   auto        tx = f.ws->start_transaction(0);
+   users_table users(tx, "U/");
+
+   users.put(PmidxUser{1, "alice", 100});
+   REQUIRE_NOTHROW(users.put(PmidxUser{1, "alice", 100}));   // identical
+   REQUIRE_NOTHROW(users.put(PmidxUser{1, "alice", 200}));   // same pk, different group
+
+   auto v = users.find<by_id>(std::uint64_t{1});
+   REQUIRE(v.has_value());
+   REQUIRE(v->group_id == 200);
+
+   tx.commit();
+}
+
+TEST_CASE("ordered_unique<by_name>: collision on update rejected",
+          "[table][secondary][unique][collision]")
+{
+   fixture     f;
+   auto        tx = f.ws->start_transaction(0);
+   users_table users(tx, "U/");
+
+   users.put(PmidxUser{1, "alice", 100});
+   users.put(PmidxUser{2, "bob",   200});
+
+   // Try to rename bob → alice. Collides with id=1's name.
+   REQUIRE_THROWS_AS(
+       users.put(PmidxUser{2, "alice", 200}),
+       psitri_multiindex::secondary_collision);
+
+   tx.commit();
+}
+
+TEST_CASE("named-tag: subtx abort restores secondary indexes too",
+          "[table][secondary][named-tag][subtx]")
+{
+   fixture     f;
+   auto        tx = f.ws->start_transaction(0);
+   users_table users(tx, "U/");
+
+   users.put(PmidxUser{1, "alice", 100});
+   {
+      auto sub = tx.sub_transaction();
+      users.put(PmidxUser{1, "alice2", 100});
+      sub.abort();
+   }
+
+   auto v = users.find<by_id>(std::uint64_t{1});
+   REQUIRE(v.has_value());
+   REQUIRE(v->name == "alice");
+
+   REQUIRE(users.find<by_name>(std::string("alice")).has_value());
+   REQUIRE_FALSE(users.find<by_name>(std::string("alice2")).has_value());
 
    tx.commit();
 }

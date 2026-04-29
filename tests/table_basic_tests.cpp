@@ -16,16 +16,18 @@
 
 using namespace psitri_multiindex;
 
-namespace pmidx_test
+struct PmidxAccount
 {
-   struct account
-   {
-      std::uint64_t id;
-      std::string   name;
-      std::uint64_t balance;
-      std::string   notes;
-   };
-   PSIO_REFLECT(account, id, name, balance, notes)
+   std::uint64_t id;
+   std::string   name;
+   std::uint64_t balance;
+   std::string   notes;
+};
+PSIO_REFLECT(PmidxAccount, id, name, balance, notes)
+
+namespace pmidx_basic_test
+{
+   struct by_id;
 
    struct test_db
    {
@@ -46,12 +48,13 @@ namespace pmidx_test
       ~test_db() { std::error_code ec; std::filesystem::remove_all(dir, ec); }
    };
 
-   using accounts_table = table<account, &account::id>;
-}  // namespace pmidx_test
+   using accounts_table =
+       table<PmidxAccount, ordered_unique<by_id, &PmidxAccount::id>>;
+}  // namespace pmidx_basic_test
 
-using pmidx_test::account;
-using pmidx_test::accounts_table;
-using pmidx_test::test_db;
+using pmidx_basic_test::accounts_table;
+using pmidx_basic_test::by_id;
+using pmidx_basic_test::test_db;
 
 TEST_CASE("table: put + get round-trips a primary row", "[table][basic]")
 {
@@ -59,7 +62,7 @@ TEST_CASE("table: put + get round-trips a primary row", "[table][basic]")
    auto    tx = t.ws->start_transaction(0);
    accounts_table accounts(tx, "acc/");
 
-   accounts.put(account{42, "alice", 100, "primary user"});
+   accounts.put(PmidxAccount{42, "alice", 100, "primary user"});
 
    auto v = accounts.get(std::uint64_t{42});
    REQUIRE(v.has_value());
@@ -86,8 +89,8 @@ TEST_CASE("table: put replaces existing row", "[table][basic]")
    auto    tx = t.ws->start_transaction(0);
    accounts_table accounts(tx, "acc/");
 
-   accounts.put(account{1, "alice", 100, "v1"});
-   accounts.put(account{1, "alice", 200, "v2"});
+   accounts.put(PmidxAccount{1, "alice", 100, "v1"});
+   accounts.put(PmidxAccount{1, "alice", 200, "v2"});
 
    auto v = accounts.get(std::uint64_t{1});
    REQUIRE(v.has_value());
@@ -103,7 +106,7 @@ TEST_CASE("table: erase by key removes row", "[table][basic]")
    auto    tx = t.ws->start_transaction(0);
    accounts_table accounts(tx, "acc/");
 
-   accounts.put(account{7, "bob", 50, ""});
+   accounts.put(PmidxAccount{7, "bob", 50, ""});
    REQUIRE(accounts.contains(std::uint64_t{7}));
    REQUIRE(accounts.erase(std::uint64_t{7}));
    REQUIRE_FALSE(accounts.contains(std::uint64_t{7}));
@@ -116,14 +119,14 @@ TEST_CASE("table: many primaries persist across commit", "[table][basic]")
 {
    test_db t;
    {
-      auto    tx = t.ws->start_transaction(0);
+      auto           tx = t.ws->start_transaction(0);
       accounts_table accounts(tx, "acc/");
       for (std::uint64_t k = 1; k <= 20; ++k)
-         accounts.put(account{k, "user_" + std::to_string(k), k * 10, ""});
+         accounts.put(PmidxAccount{k, "user_" + std::to_string(k), k * 10, ""});
       tx.commit();
    }
    {
-      auto tx = t.ws->start_transaction(0);
+      auto           tx = t.ws->start_transaction(0);
       accounts_table accounts(tx, "acc/");
       for (std::uint64_t k = 1; k <= 20; ++k)
       {
@@ -142,8 +145,8 @@ TEST_CASE("table: separate prefixes give separate keyspaces", "[table][basic]")
    accounts_table table_a(tx, "A/");
    accounts_table table_b(tx, "B/");
 
-   table_a.put(account{1, "alice", 100, ""});
-   table_b.put(account{1, "bob", 200, ""});
+   table_a.put(PmidxAccount{1, "alice", 100, ""});
+   table_b.put(PmidxAccount{1, "bob", 200, ""});
 
    auto a = table_a.get(std::uint64_t{1});
    auto b = table_b.get(std::uint64_t{1});
@@ -151,6 +154,21 @@ TEST_CASE("table: separate prefixes give separate keyspaces", "[table][basic]")
    REQUIRE(b.has_value());
    REQUIRE(a->name == "alice");
    REQUIRE(b->name == "bob");
+
+   tx.commit();
+}
+
+TEST_CASE("table: find<by_id> is the primary lookup",
+          "[table][basic][named-tag]")
+{
+   test_db        t;
+   auto           tx = t.ws->start_transaction(0);
+   accounts_table accounts(tx, "acc/");
+   accounts.put(PmidxAccount{42, "alice", 100, ""});
+
+   auto v = accounts.find<by_id>(std::uint64_t{42});
+   REQUIRE(v.has_value());
+   REQUIRE(v->name == "alice");
 
    tx.commit();
 }

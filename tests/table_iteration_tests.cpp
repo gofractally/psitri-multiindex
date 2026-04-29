@@ -17,14 +17,16 @@
 
 using namespace psitri_multiindex;
 
+struct PmidxIterRow
+{
+   std::uint64_t id;
+   std::string   name;
+};
+PSIO_REFLECT(PmidxIterRow, id, name)
+
 namespace pmidx_iter_test
 {
-   struct row
-   {
-      std::uint64_t id;
-      std::string   name;
-   };
-   PSIO_REFLECT(row, id, name)
+   struct by_id;
 
    struct fixture
    {
@@ -45,11 +47,12 @@ namespace pmidx_iter_test
       ~fixture() { std::error_code ec; std::filesystem::remove_all(dir, ec); }
    };
 
-   using rows_table = table<row, &row::id>;
+   using rows_table =
+       table<PmidxIterRow, ordered_unique<by_id, &PmidxIterRow::id>>;
 }  // namespace pmidx_iter_test
 
+using pmidx_iter_test::by_id;
 using pmidx_iter_test::fixture;
-using pmidx_iter_test::row;
 using pmidx_iter_test::rows_table;
 
 TEST_CASE("iter: begin/end on empty table is equal", "[table][iter]")
@@ -63,14 +66,13 @@ TEST_CASE("iter: begin/end on empty table is equal", "[table][iter]")
 
 TEST_CASE("iter: begin walks all rows in primary order", "[table][iter]")
 {
-   fixture f;
-   auto    tx = f.ws->start_transaction(0);
+   fixture    f;
+   auto       tx = f.ws->start_transaction(0);
    rows_table rows(tx, "R/");
 
-   // Insert out of order.
    for (std::uint64_t k : {std::uint64_t{5}, std::uint64_t{1}, std::uint64_t{3},
                            std::uint64_t{2}, std::uint64_t{4}})
-      rows.put(row{k, "v" + std::to_string(k)});
+      rows.put(PmidxIterRow{k, "v" + std::to_string(k)});
 
    std::vector<std::uint64_t> seen;
    for (auto it = rows.begin(); it != rows.end(); ++it)
@@ -83,12 +85,12 @@ TEST_CASE("iter: begin walks all rows in primary order", "[table][iter]")
 TEST_CASE("iter: lower_bound returns iterator at >= key",
           "[table][iter][bounds]")
 {
-   fixture f;
-   auto    tx = f.ws->start_transaction(0);
+   fixture    f;
+   auto       tx = f.ws->start_transaction(0);
    rows_table rows(tx, "R/");
 
    for (std::uint64_t k = 10; k <= 50; k += 10)
-      rows.put(row{k, ""});
+      rows.put(PmidxIterRow{k, ""});
 
    {
       auto it = rows.lower_bound(std::uint64_t{25});
@@ -98,11 +100,11 @@ TEST_CASE("iter: lower_bound returns iterator at >= key",
    {
       auto it = rows.lower_bound(std::uint64_t{30});
       REQUIRE(it != rows.end());
-      REQUIRE((*it).id == 30);  // exact hit
+      REQUIRE((*it).id == 30);
    }
    {
       auto it = rows.lower_bound(std::uint64_t{60});
-      REQUIRE(it == rows.end());  // past last
+      REQUIRE(it == rows.end());
    }
    tx.commit();
 }
@@ -110,21 +112,21 @@ TEST_CASE("iter: lower_bound returns iterator at >= key",
 TEST_CASE("iter: upper_bound returns iterator at > key",
           "[table][iter][bounds]")
 {
-   fixture f;
-   auto    tx = f.ws->start_transaction(0);
+   fixture    f;
+   auto       tx = f.ws->start_transaction(0);
    rows_table rows(tx, "R/");
 
    for (std::uint64_t k = 10; k <= 50; k += 10)
-      rows.put(row{k, ""});
+      rows.put(PmidxIterRow{k, ""});
 
    {
       auto it = rows.upper_bound(std::uint64_t{30});
       REQUIRE(it != rows.end());
-      REQUIRE((*it).id == 40);  // strictly greater than 30
+      REQUIRE((*it).id == 40);
    }
    {
       auto it = rows.upper_bound(std::uint64_t{50});
-      REQUIRE(it == rows.end());  // nothing > 50
+      REQUIRE(it == rows.end());
    }
    tx.commit();
 }
@@ -132,12 +134,12 @@ TEST_CASE("iter: upper_bound returns iterator at > key",
 TEST_CASE("iter: range iteration via lower_bound + upper_bound",
           "[table][iter][bounds]")
 {
-   fixture f;
-   auto    tx = f.ws->start_transaction(0);
+   fixture    f;
+   auto       tx = f.ws->start_transaction(0);
    rows_table rows(tx, "R/");
 
    for (std::uint64_t k = 1; k <= 20; ++k)
-      rows.put(row{k, ""});
+      rows.put(PmidxIterRow{k, ""});
 
    std::vector<std::uint64_t> seen;
    auto it  = rows.lower_bound(std::uint64_t{5});
@@ -148,19 +150,43 @@ TEST_CASE("iter: range iteration via lower_bound + upper_bound",
    tx.commit();
 }
 
+TEST_CASE("iter: zero-copy view via value_pin",
+          "[table][iter][zero-copy]")
+{
+   fixture    f;
+   auto       tx = f.ws->start_transaction(0);
+   rows_table rows(tx, "R/");
+
+   for (std::uint64_t k = 1; k <= 5; ++k)
+      rows.put(PmidxIterRow{k, "row_" + std::to_string(k)});
+
+   // pin_values returns a value_pin that pins the segment for the
+   // remaining iteration. View bytes are valid as long as `pin` lives.
+   {
+      auto pin = rows.pin_values();
+      std::vector<std::uint64_t> seen;
+      for (auto it = rows.begin(); it != rows.end(); ++it)
+      {
+         auto v = it.view(pin);                           // zero-copy
+         seen.push_back(v.template get<0>());             // arithmetic by value
+      }
+      REQUIRE(seen == std::vector<std::uint64_t>{1, 2, 3, 4, 5});
+   }
+
+   tx.commit();
+}
+
 TEST_CASE("iter: stops at table prefix boundary", "[table][iter][isolation]")
 {
-   // Two tables on the same transaction with different prefixes; iterating
-   // one must not bleed into the other's rows even though they share a tree.
-   fixture f;
-   auto    tx = f.ws->start_transaction(0);
+   fixture    f;
+   auto       tx = f.ws->start_transaction(0);
    rows_table table_a(tx, "A/");
    rows_table table_b(tx, "B/");
 
    for (std::uint64_t k = 1; k <= 5; ++k)
-      table_a.put(row{k, "a" + std::to_string(k)});
+      table_a.put(PmidxIterRow{k, "a" + std::to_string(k)});
    for (std::uint64_t k = 1; k <= 5; ++k)
-      table_b.put(row{k, "b" + std::to_string(k)});
+      table_b.put(PmidxIterRow{k, "b" + std::to_string(k)});
 
    std::vector<std::string> a_names;
    for (auto it = table_a.begin(); it != table_a.end(); ++it)
