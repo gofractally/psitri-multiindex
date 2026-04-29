@@ -39,15 +39,6 @@ commit in the relevant doc / changelog instead of leaving a "[done]" stub.
 
 ## API surface
 
-- **Adapter views (psio upstream).** `view<T, Fmt>::get<N>()` for a
-  field whose type has a `binary_category` / `sortable_binary_category`
-  adapter has no defined behavior — the view machinery can locate the
-  field's bytes (the format frames it) but doesn't know to delegate
-  field-level access to the adapter. Today the work-around is decode-
-  by-value via `psio::decode<FieldT>`. Proper fix: an optional
-  `adapter::make_view(span<const char>)` slot consulted by the format's
-  view-traits; falls back to a `bytes_view` for opaque adapter types,
-  surfaces a proper `view<T, AdapterTag>` for structured ones.
 - **`psio::key` long-double / float128 support.** `psio::key` handles
   `float` and `double` (sign-flipped BE, matches IEEE 754). 128-bit
   float (Spring's `index_long_double_index`) is unsupported — would
