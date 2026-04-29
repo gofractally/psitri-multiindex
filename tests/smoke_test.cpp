@@ -8,7 +8,8 @@
 // This is intentionally minimal — its purpose is to validate the build
 // plumbing, not the eventual multi-index API.
 
-#include <psio/fracpack.hpp>
+#include <psio/cpo.hpp>
+#include <psio/pssz.hpp>
 
 #include <psitri/database.hpp>
 #include <psitri/database_impl.hpp>
@@ -72,10 +73,15 @@ int main()
 
    std::filesystem::remove_all(dir);
 
-   // psio reachability: instantiate something that pulls in fracpack
-   // declarations to confirm the include path resolves and the headers
-   // compile under our cxx_std_23 + boost setup.
-   (void)sizeof(psio::input_stream);
+   // psio reachability: encode a tiny value and decode it via the v3
+   // CPO surface to confirm headers compile and link.
+   {
+      auto bytes = psio::encode(psio::pssz{}, std::uint64_t{0xdeadbeef});
+      auto round = psio::decode<std::uint64_t>(psio::pssz{},
+                                               std::span<const char>{bytes});
+      if (round != 0xdeadbeef)
+         return 1;
+   }
 
    std::printf("psitri-multiindex smoke test passed\n");
    return 0;
