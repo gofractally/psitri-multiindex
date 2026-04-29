@@ -39,12 +39,7 @@ commit in the relevant doc / changelog instead of leaving a "[done]" stub.
 
 ## API surface
 
-- **`psio::key` long-double / float128 support.** `psio::key` handles
-  `float` and `double` (sign-flipped BE, matches IEEE 754). 128-bit
-  float (Spring's `index_long_double_index`) is unsupported — would
-  need an upstream psio addition or, more practically, a user-defined
-  `sortable_binary_category` adapter that converts long-double to a
-  fixed-width sort-preserving byte sequence.
+(empty — Spring/Antelope shape closure landed.)
 
 ## Performance / fast paths
 

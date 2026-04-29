@@ -193,16 +193,16 @@ work as-is when ported:
 | `table_id_multi_index` | auto-id + `(code, scope, table)` | works |
 | `block_summary_multi_index`, `global_property_multi_index`, `dynamic_global_property_multi_index`, `protocol_state_multi_index`, `database_header_multi_index` | auto-id only | works |
 | `key_value_index`, `index64/128/256_index` | auto-id + composite `(t_id, primary_key)` etc. with explicit `composite_key_compare<std::less<...>, ...>` | the explicit comparator is the default; works |
+| `index_double_index` | auto-id + IEEE 754 `double` secondary | psio::key encodes `double` with the standard sign-flip + big-endian transform — matches Spring's `soft_double_less` for finite non-NaN values |
+| `index_long_double_index` | auto-id + IEEE 754 binary128 secondary | use `psio::float128` (16-byte, layout-compatible with softfloat's `float128_t`); psio's built-in `sortable_binary_category` adapter applies the IEEE 754 sort transform. See `tests/antelope_shapes_tests.cpp` "index_long_double_index — by_secondary on float128" |
 
-Gaps blocked on psio upstream:
+Patterns for non-built-in scalar types:
 - **Digest-as-key** (`fc::sha256`, `transaction_id_type`, `digest_type`,
-  `block_id_type`). Now supported via the
-  `sortable_binary_category` adapter slot — register a
-  `PSIO_ADAPTER(MyDigest, psio::sortable_binary_category, MyCodec)`
-  that emits the digest's raw bytes; psio::key consults the adapter
-  for both encoding and ordering. See
-  `tests/antelope_shapes_tests.cpp` "transaction_multi_index — by_trx_id
-  on a 32-byte digest".
+  `block_id_type`). Register a `PSIO_ADAPTER(MyDigest,
+  psio::sortable_binary_category, MyCodec)` that emits the digest's
+  raw bytes; `psio::key` consults the adapter for both encoding and
+  ordering. See `tests/antelope_shapes_tests.cpp`
+  "transaction_multi_index — by_trx_id on a 32-byte digest".
 - **`long double` / `float128_t`** sort. `psio::key` handles `float`
   and `double` via sign-flipped big-endian (matches IEEE 754 less-than
   on finite values, including the NaN / signed-zero subtleties Spring's

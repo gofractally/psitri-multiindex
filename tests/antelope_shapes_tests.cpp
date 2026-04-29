@@ -15,6 +15,8 @@
 
 #include <psio/ext_int.hpp>
 #include <psio/reflect.hpp>
+
+#include <algorithm>
 #include <psitri/database.hpp>
 #include <psitri/database_impl.hpp>
 #include <psitri/transaction.hpp>
@@ -86,6 +88,17 @@ struct PmidxIndexDouble
    double        secondary_key;
 };
 PSIO_REFLECT(PmidxIndexDouble, id, secondary_key)
+
+// index_long_double pattern: pk + float128 secondary. Uses psio's
+// 16-byte float128 type, which has built-in sortable_binary_category
+// and binary_category adapters — psio::key applies the IEEE 754 sort
+// transform, pssz writes 16 raw bytes.
+struct PmidxIndexLongDouble
+{
+   std::uint64_t  id;
+   psio::float128 secondary_key;
+};
+PSIO_REFLECT(PmidxIndexLongDouble, id, secondary_key)
 
 // fc::sha256 / transaction_id_type stand-in: 32 raw bytes, treated as
 // memcmp-sortable via a sortable_binary_category adapter. Fixed-width,
@@ -445,6 +458,74 @@ TEST_CASE("antelope: transaction_multi_index — by_trx_id on a 32-byte digest",
    // Collision: same digest at a different pk — must throw.
    REQUIRE_THROWS_AS(t.insert(PmidxTransaction{0, d_a}),
                      psitri_multiindex::secondary_collision);
+
+   tx.commit();
+}
+
+// ── index_long_double_index — by_secondary on float128 ───────────────────
+//
+// Spring's `index_long_double_index` uses Berkeley softfloat's
+// `float128_t` for deterministic IEEE 754 binary128 sorting. psio's
+// `float128` is layout-compatible (16 bytes, two u64 limbs); the
+// sortable_binary_category adapter applies the standard sign-flip /
+// bit-not transform so memcmp matches f128_lt for finite non-NaN
+// values. -0.0 canonicalises to +0.0 in the sort key.
+
+namespace {
+   psio::float128 from_double(double d)
+   {
+      std::uint64_t bits;
+      std::memcpy(&bits, &d, 8);
+      const std::uint64_t sign   = (bits >> 63) & 1;
+      const std::uint64_t exp64  = (bits >> 52) & 0x7ff;
+      const std::uint64_t frac64 = bits & ((1ull << 52) - 1);
+      psio::float128      out{};
+      if (exp64 == 0 && frac64 == 0)
+      {
+         out.limb[1] = sign << 63;
+         return out;
+      }
+      const std::uint64_t exp128 = exp64 + (16383 - 1023);
+      out.limb[1] = (sign << 63) | (exp128 << 48) | (frac64 >> 4);
+      out.limb[0] = (frac64 & 0xf) << 60;
+      return out;
+   }
+}  // namespace
+
+TEST_CASE("antelope: index_long_double_index — by_secondary on float128",
+          "[antelope][index_long_double]")
+{
+   using ild = table<
+       PmidxIndexLongDouble,
+       ordered_unique<by_id,        &PmidxIndexLongDouble::id>,
+       ordered_unique<by_secondary, &PmidxIndexLongDouble::secondary_key>>;
+
+   fixture f;
+   auto    tx = f.ws->start_transaction(0);
+   ild     t(tx, "ild/");
+
+   // Insert in arbitrary order; iteration must come out sorted by IEEE
+   // 754 ordering on the secondary key.
+   const std::vector<double> ds = {
+       1e100, -1.5, 0.0, 3.14, -1e-300, -1e100, 1e-300, 2.5,
+   };
+   for (double x : ds)
+      t.insert(PmidxIndexLongDouble{0, from_double(x)});
+
+   std::vector<double> sorted_in = ds;
+   std::sort(sorted_in.begin(), sorted_in.end());
+
+   std::vector<psio::float128> walked;
+   for (auto it = t.begin<by_secondary>(); it != t.end<by_secondary>(); ++it)
+      walked.push_back((*it).secondary_key);
+   REQUIRE(walked.size() == ds.size());
+   for (std::size_t i = 0; i < walked.size(); ++i)
+      REQUIRE(walked[i] == from_double(sorted_in[i]));
+
+   // lower_bound at zero — first row with secondary >= 0.0.
+   auto it = t.lower_bound<by_secondary>(from_double(0.0));
+   REQUIRE(it != t.end<by_secondary>());
+   REQUIRE((*it).secondary_key == from_double(0.0));
 
    tx.commit();
 }
