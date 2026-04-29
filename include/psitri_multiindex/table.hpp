@@ -245,36 +245,40 @@ namespace psitri_multiindex
 
       // ── Mutations ─────────────────────────────────────────────────────
 
+      // Upsert a row.
+      //
+      // Atomicity: when `num_secondaries > 0`, every unique secondary's
+      // collision check runs BEFORE any tree write. A collision aborts the
+      // call without touching the trie, so a mid-call throw cannot leave
+      // partial secondary state. Sub-transactions are still recommended
+      // for multi-row work, but a single `put` is self-atomic on its own.
       void put(const T& row)
       {
          const auto pk_value = detail::invoke_extractor<Primary::extractor>(row);
          auto       pk_bytes = encode_primary_key(prefix_view(), pk_value);
 
-         bool was_insert = false;
+         auto       existing_raw =
+             _tx->template get<std::string>(detail::key_view_of(pk_bytes));
+         const bool was_insert = !existing_raw.has_value();
+
          if constexpr (num_secondaries > 0)
          {
-            if (auto existing = _tx->template get<std::string>(detail::key_view_of(pk_bytes)))
+            constexpr auto seq = std::make_index_sequence<num_secondaries>{};
+            if (existing_raw)
             {
-               // Existing row: extract old secondary keys via a view over the
-               // encoded bytes (zero-copy on the diff path).
-               auto v = psio::view<T, psio::pssz, psio::storage::const_borrow>{
-                   std::span<const char>{existing->data(), existing->size()}};
-               replace_secondaries_diff(v, row, pk_bytes,
-                                        std::make_index_sequence<num_secondaries>{});
+               T old_row = psio::decode<T>(
+                   psio::pssz{}, std::span<const char>(existing_raw->data(),
+                                                       existing_raw->size()));
+               // Phase 1: validate (no writes).
+               validate_secondaries_diff(old_row, row, pk_bytes, seq);
+               // Phase 2: apply.
+               apply_secondaries_diff(old_row, row, pk_bytes, seq);
             }
             else
             {
-               was_insert = true;
-               write_all_secondaries(row, pk_bytes,
-                                     std::make_index_sequence<num_secondaries>{});
+               validate_all_secondaries(row, pk_bytes, seq);
+               apply_all_secondaries(row, pk_bytes, seq);
             }
-         }
-         else if (_track_row_count)
-         {
-            // No secondaries → cheap probe for "row already there".
-            was_insert = !_tx->template get<std::string>(
-                              detail::key_view_of(pk_bytes))
-                              .has_value();
          }
 
          auto packed = psio::encode(psio::pssz{}, row);
@@ -349,6 +353,100 @@ namespace psitri_multiindex
          return erase(detail::invoke_extractor<Primary::extractor>(row));
       }
 
+      // Erase every key under the table's prefix (primary tree + every
+      // secondary tree + header). Re-stamps the row_count flag if it was
+      // enabled at construction.
+      //
+      // Throws std::invalid_argument if the table prefix is all 0xff bytes
+      // (no lex successor — pathological).
+      void clear()
+      {
+         auto lo = std::vector<char>(_prefix.begin(), _prefix.end());
+         auto hi = lo;
+         if (!lex_increment(hi))
+         {
+            throw std::invalid_argument(
+                "psitri_multiindex::table::clear: prefix has no lex "
+                "successor (all 0xff) — pick a non-saturated prefix");
+         }
+         _tx->remove_range(detail::key_view_of(lo), detail::key_view_of(hi));
+
+         if (_track_row_count)
+         {
+            table_header h{};
+            h.flags     = TABLE_FLAG_ROW_COUNT_ENABLED;
+            h.row_count = 0;
+            write_header(h);
+         }
+      }
+
+      // Half-open range erase over the primary index: removes every row
+      // whose primary key is in [lo, hi). Returns the count erased.
+      //
+      // For tables without secondaries this is a single trie-level
+      // remove_range. For tables with secondaries we walk the range,
+      // collect primary keys, and call erase() for each so secondary
+      // entries are cleaned up consistently.
+      template <typename K>
+      std::size_t erase_range(const K& lo, const K& hi)
+      {
+         if constexpr (num_secondaries > 0)
+         {
+            std::vector<primary_key_type> to_erase;
+            for (auto it = lower_bound(lo), e = lower_bound(hi); it != e; ++it)
+               to_erase.push_back(
+                   detail::invoke_extractor<Primary::extractor>(*it));
+
+            std::size_t n = 0;
+            for (const auto& pk : to_erase)
+               if (erase(pk))
+                  ++n;
+            return n;
+         }
+         else
+         {
+            auto lo_b = encode_primary_key(prefix_view(), lo);
+            auto hi_b = encode_primary_key(prefix_view(), hi);
+            const auto erased = static_cast<std::size_t>(
+                _tx->remove_range(detail::key_view_of(lo_b),
+                                  detail::key_view_of(hi_b)));
+            if (_track_row_count && erased > 0)
+            {
+               auto h = read_header();
+               if (h.row_count.has_value() && *h.row_count >= erased)
+                  h.row_count = *h.row_count - erased;
+               write_header(h);
+            }
+            return erased;
+         }
+      }
+
+      // Read-mutate-write helper. `fn(T&)` is invoked on a local copy of the
+      // row at `pk_value`; the mutated copy is then `put` back. Returns
+      // false if the row doesn't exist (callback is not called).
+      //
+      // The callback MUST NOT change the primary key — chainbase semantics.
+      // Throws `std::logic_error` if the primary-key field differs after
+      // the callback returns.
+      template <typename K, typename F>
+      bool modify(const K& pk_value, F&& fn)
+      {
+         auto current = get(pk_value);
+         if (!current.has_value())
+            return false;
+         std::forward<F>(fn)(*current);
+         const auto new_pk =
+             detail::invoke_extractor<Primary::extractor>(*current);
+         if (static_cast<primary_key_type>(new_pk) !=
+             static_cast<primary_key_type>(pk_value))
+         {
+            throw std::logic_error(
+                "psitri_multiindex::modify: callback changed the primary key");
+         }
+         put(*current);
+         return true;
+      }
+
       // ── Reads ─────────────────────────────────────────────────────────
 
       // Primary-key lookup. Returns nullopt if not found.
@@ -368,6 +466,67 @@ namespace psitri_multiindex
       {
          auto pk_bytes = encode_primary_key(prefix_view(), pk_value);
          return _tx->template get<std::string>(detail::key_view_of(pk_bytes)).has_value();
+      }
+
+      // Existence probe by named tag.
+      //   - primary: equivalent to `contains(key_value)`.
+      //   - unique secondary: probes the secondary tree (no row decode).
+      //   - non-unique secondary: lower_bound at the (sk) prefix; true iff
+      //     the cursor lands on a key starting with that prefix.
+      template <typename Tag, typename K>
+      bool contains(const K& key_value) const
+      {
+         using Idx = typename find_index_by_tag<Tag>::type;
+         constexpr std::size_t one_based = find_index_by_tag<Tag>::position;
+
+         if constexpr (one_based == 0)
+         {
+            return contains(key_value);
+         }
+         else if constexpr (Idx::is_unique)
+         {
+            auto sk_bytes =
+                encode_secondary_key(prefix_view(), one_based, key_value);
+            return _tx->template get<std::string>(
+                       detail::key_view_of(sk_bytes))
+                .has_value();
+         }
+         else
+         {
+            auto pfx =
+                encode_secondary_key(prefix_view(), one_based, key_value);
+            auto cur = _tx->lower_bound(detail::key_view_of(pfx));
+            if (cur.is_end())
+               return false;
+            auto k = cur.key();
+            return k.size() >= pfx.size() &&
+                   std::memcmp(k.data(), pfx.data(), pfx.size()) == 0;
+         }
+      }
+
+      // Number of rows whose tag-key equals `key_value`.
+      //   - primary / unique: 0 or 1.
+      //   - non-unique: walks the (sk, *) block.
+      template <typename Tag, typename K>
+      std::size_t count(const K& key_value) const
+      {
+         using Idx = typename find_index_by_tag<Tag>::type;
+         constexpr std::size_t one_based = find_index_by_tag<Tag>::position;
+
+         if constexpr (one_based == 0 || Idx::is_unique)
+         {
+            return contains<Tag>(key_value) ? 1 : 0;
+         }
+         else
+         {
+            // Walk the (sk, *) block via equal_range without dereferencing
+            // — count only.
+            auto        rng = equal_range<Tag>(key_value);
+            std::size_t n   = 0;
+            for (auto it = rng.begin(); it != rng.end(); ++it)
+               ++n;
+            return n;
+         }
       }
 
       // Find a row by tag. For unique secondaries, returns the matching row
@@ -479,6 +638,18 @@ namespace psitri_multiindex
             return *this;
          }
 
+         // Re-position this iterator to the first row with primary key
+         // ≥ pk_value, without constructing a fresh cursor.
+         template <typename K>
+         primary_iterator& seek(const K& pk_value)
+         {
+            auto k = encode_primary_key(_table->prefix_view(), pk_value);
+            _cur.lower_bound(detail::key_view_of(k));
+            _at_end = false;
+            check_in_range();
+            return *this;
+         }
+
          friend bool operator==(const primary_iterator& a,
                                 const primary_iterator& b) noexcept
          {
@@ -564,22 +735,27 @@ namespace psitri_multiindex
 
       // ── Range query for non-unique secondary index ────────────────────
       //
-      // A range over all rows whose secondary key (extracted by the index's
-      // extractor) equals key_value. Iterates in (sk, pk) tree order; each
-      // dereference yields a decoded row.
+      // Iteration over a secondary index, in (sk, pk) tree order. Works
+      // uniformly for ordered_unique and ordered_non_unique tags — each
+      // entry's value is the primary-key bytes, so dereferencing always
+      // re-fetches the primary row.
+      //
+      // The iterator carries a `_stop_prefix`: it transitions to end when
+      // the cursor's current key no longer starts with `_stop_prefix`.
+      //   - `equal_range<Tag>(k)`: stop_prefix = encode(prefix||idx||k)
+      //   - `begin<Tag>()` / bounds: stop_prefix = encode(prefix||idx)
 
       template <typename Tag>
-      class secondary_range_iterator
+      class secondary_iterator
       {
         public:
-         using index_type  = typename find_index_by_tag<Tag>::type;
-         static_assert(!index_type::is_unique,
-                       "secondary_range_iterator only valid for ordered_non_unique tags");
+         using index_type = typename find_index_by_tag<Tag>::type;
 
-         secondary_range_iterator(const table*      tbl,
-                                  psitri::cursor    c,
-                                  std::vector<char> sk_prefix)
-             : _table(tbl), _cur(std::move(c)), _sk_prefix(std::move(sk_prefix))
+         secondary_iterator(const table*      tbl,
+                            psitri::cursor    c,
+                            std::vector<char> stop_prefix)
+             : _table(tbl), _cur(std::move(c)),
+               _stop_prefix(std::move(stop_prefix))
          {
             check_in_range();
          }
@@ -587,7 +763,7 @@ namespace psitri_multiindex
          struct end_tag
          {
          };
-         secondary_range_iterator(const table* tbl, end_tag)
+         secondary_iterator(const table* tbl, end_tag)
              : _table(tbl), _cur(tbl->_tx->read_cursor()), _at_end(true)
          {
          }
@@ -601,15 +777,15 @@ namespace psitri_multiindex
                 psio::pssz{}, std::span<const char>(raw->data(), raw->size()));
          }
 
-         secondary_range_iterator& operator++()
+         secondary_iterator& operator++()
          {
             _cur.next();
             check_in_range();
             return *this;
          }
 
-         friend bool operator==(const secondary_range_iterator& a,
-                                const secondary_range_iterator& b) noexcept
+         friend bool operator==(const secondary_iterator& a,
+                                const secondary_iterator& b) noexcept
          {
             if (a._at_end || b._at_end)
                return a._at_end && b._at_end;
@@ -618,10 +794,16 @@ namespace psitri_multiindex
             return ak.size() == bk.size() &&
                    std::memcmp(ak.data(), bk.data(), ak.size()) == 0;
          }
-         friend bool operator!=(const secondary_range_iterator& a,
-                                const secondary_range_iterator& b) noexcept
+         friend bool operator!=(const secondary_iterator& a,
+                                const secondary_iterator& b) noexcept
          {
             return !(a == b);
+         }
+
+         std::string_view raw_key() const noexcept
+         {
+            const auto k = _cur.key();
+            return std::string_view(k.data(), k.size());
          }
 
         private:
@@ -633,41 +815,111 @@ namespace psitri_multiindex
                return;
             }
             const auto k = _cur.key();
-            if (k.size() < _sk_prefix.size() ||
-                std::memcmp(k.data(), _sk_prefix.data(), _sk_prefix.size()) != 0)
+            if (k.size() < _stop_prefix.size() ||
+                std::memcmp(k.data(), _stop_prefix.data(), _stop_prefix.size()) != 0)
                _at_end = true;
          }
 
          const table*      _table;
          psitri::cursor    _cur;
-         std::vector<char> _sk_prefix;
+         std::vector<char> _stop_prefix;
          bool              _at_end = false;
       };
 
       template <typename Tag>
       struct secondary_range
       {
-         secondary_range_iterator<Tag> _begin, _end;
-         secondary_range_iterator<Tag> begin() const { return _begin; }
-         secondary_range_iterator<Tag> end() const { return _end; }
+         secondary_iterator<Tag> _begin, _end;
+         secondary_iterator<Tag> begin() const { return _begin; }
+         secondary_iterator<Tag> end() const { return _end; }
       };
 
+      // Range covering all rows whose secondary key equals `key_value`.
+      // For unique tags the range is 0 or 1 elements; for non-unique it
+      // spans the whole (sk, *) block in pk order.
       template <typename Tag, typename K>
       secondary_range<Tag> equal_range(const K& key_value) const
       {
-         using Idx = typename find_index_by_tag<Tag>::type;
          constexpr std::size_t one_based = find_index_by_tag<Tag>::position;
-         static_assert(!Idx::is_unique,
-                       "equal_range only valid for ordered_non_unique tags; "
-                       "use find<Tag> for unique secondaries");
+         static_assert(one_based != 0,
+                       "equal_range<Tag>: use lower_bound/upper_bound for the primary index");
 
          auto prefix =
              encode_secondary_key(prefix_view(), one_based, key_value);
          auto c =
              _tx->lower_bound(psitri::key_view(prefix.data(), prefix.size()));
-         return {secondary_range_iterator<Tag>(this, std::move(c), prefix),
-                 secondary_range_iterator<Tag>(
-                     this, typename secondary_range_iterator<Tag>::end_tag{})};
+         return {secondary_iterator<Tag>(this, std::move(c), prefix),
+                 secondary_iterator<Tag>(
+                     this, typename secondary_iterator<Tag>::end_tag{})};
+      }
+
+      // Walk the entire secondary tag in (sk, pk) tree order.
+      template <typename Tag>
+      secondary_iterator<Tag> begin() const
+      {
+         constexpr std::size_t one_based = find_index_by_tag<Tag>::position;
+         static_assert(one_based != 0,
+                       "begin<Tag>: use begin() for the primary index");
+         auto pfx = encode_index_prefix(prefix_view(),
+                                        prefix_byte_for_index(one_based));
+         auto c = _tx->lower_bound(detail::key_view_of(pfx));
+         return secondary_iterator<Tag>(this, std::move(c), pfx);
+      }
+
+      template <typename Tag>
+      secondary_iterator<Tag> end() const
+      {
+         constexpr std::size_t one_based = find_index_by_tag<Tag>::position;
+         static_assert(one_based != 0,
+                       "end<Tag>: use end() for the primary index");
+         return secondary_iterator<Tag>(
+             this, typename secondary_iterator<Tag>::end_tag{});
+      }
+
+      // First row with secondary key ≥ key_value (in tag order).
+      template <typename Tag, typename K>
+      secondary_iterator<Tag> lower_bound(const K& key_value) const
+      {
+         constexpr std::size_t one_based = find_index_by_tag<Tag>::position;
+         static_assert(one_based != 0,
+                       "lower_bound<Tag>: use lower_bound(k) for the primary index");
+         auto pfx = encode_index_prefix(prefix_view(),
+                                        prefix_byte_for_index(one_based));
+         auto k = encode_secondary_key(prefix_view(), one_based, key_value);
+         auto c = _tx->lower_bound(detail::key_view_of(k));
+         return secondary_iterator<Tag>(this, std::move(c), pfx);
+      }
+
+      // First row with secondary key strictly > key_value.
+      // For non-unique tags the encoded key is (sk, pk); we lex-increment
+      // the (idx||sk) prefix to skip past the entire (sk, *) block.
+      template <typename Tag, typename K>
+      secondary_iterator<Tag> upper_bound(const K& key_value) const
+      {
+         using Idx = typename find_index_by_tag<Tag>::type;
+         constexpr std::size_t one_based = find_index_by_tag<Tag>::position;
+         static_assert(one_based != 0,
+                       "upper_bound<Tag>: use upper_bound(k) for the primary index");
+         auto pfx = encode_index_prefix(prefix_view(),
+                                        prefix_byte_for_index(one_based));
+         auto k = encode_secondary_key(prefix_view(), one_based, key_value);
+         if constexpr (Idx::is_unique)
+         {
+            auto c = _tx->upper_bound(detail::key_view_of(k));
+            return secondary_iterator<Tag>(this, std::move(c), pfx);
+         }
+         else
+         {
+            auto k_inc = k;
+            if (!lex_increment(k_inc))
+            {
+               // Saturated — there is no key strictly greater.
+               return secondary_iterator<Tag>(
+                   this, typename secondary_iterator<Tag>::end_tag{});
+            }
+            auto c = _tx->lower_bound(detail::key_view_of(k_inc));
+            return secondary_iterator<Tag>(this, std::move(c), pfx);
+         }
       }
 
       // ── Header / metadata ─────────────────────────────────────────────
@@ -739,55 +991,127 @@ namespace psitri_multiindex
          return encode_secondary_for_row<I>(tmp_for_pk);
       }
 
-      // Write all secondaries for a fresh row (no existing record).
+      // ── Validation (read-only; throws before any tree write) ─────────
+
       template <typename Row, std::size_t... Is>
-      void write_all_secondaries(const Row&         row,
-                                 const std::vector<char>& pk_bytes,
-                                 std::index_sequence<Is...>)
+      void validate_all_secondaries(const Row&               row,
+                                    const std::vector<char>& pk_bytes,
+                                    std::index_sequence<Is...>) const
       {
-         (write_one_secondary<Is>(row, pk_bytes), ...);
+         (validate_one_insert<Is>(row, pk_bytes), ...);
       }
 
       template <std::size_t I, typename Row>
-      void write_one_secondary(const Row&               row,
-                               const std::vector<char>& pk_bytes)
+      void validate_one_insert(const Row&               row,
+                               const std::vector<char>& pk_bytes) const
       {
          using Idx = detail::nth_index_t<I, Secondaries...>;
-         auto [one_based, sk_bytes] = encode_secondary_for_row<I>(row);
-
          if constexpr (Idx::is_unique)
          {
-            // Collision check: if this secondary key already exists and its
-            // value (primary-key bytes) doesn't match the pk we're about to
-            // write, reject.
+            auto [one_based, sk_bytes] = encode_secondary_for_row<I>(row);
+            (void)one_based;
             auto existing =
                 _tx->template get<std::string>(detail::key_view_of(sk_bytes));
-            if (existing)
+            if (existing &&
+                (existing->size() != pk_bytes.size() ||
+                 std::memcmp(existing->data(), pk_bytes.data(),
+                             pk_bytes.size()) != 0))
             {
-               const auto& bytes = *existing;
-               if (bytes.size() != pk_bytes.size() ||
-                   std::memcmp(bytes.data(), pk_bytes.data(), pk_bytes.size()) != 0)
-               {
-                  throw secondary_collision(
-                      "psitri_multiindex: ordered_unique secondary key "
-                      "already in use by a different primary");
-               }
-               // Same pk → no-op (re-put of identical row). Fall through.
+               throw secondary_collision(
+                   "psitri_multiindex: ordered_unique secondary key "
+                   "already in use by a different primary");
             }
          }
+      }
 
+      template <std::size_t... Is>
+      void validate_secondaries_diff(const T&                 old_row,
+                                     const T&                 new_row,
+                                     const std::vector<char>& new_pk_bytes,
+                                     std::index_sequence<Is...>) const
+      {
+         (validate_one_diff<Is>(old_row, new_row, new_pk_bytes), ...);
+      }
+
+      template <std::size_t I>
+      void validate_one_diff(const T&                 old_row,
+                             const T&                 new_row,
+                             const std::vector<char>& new_pk_bytes) const
+      {
+         using Idx = detail::nth_index_t<I, Secondaries...>;
+         if constexpr (Idx::is_unique)
+         {
+            auto old_sk = extract_secondary_key<Idx>(old_row);
+            auto new_sk = extract_secondary_key<Idx>(new_row);
+            if (old_sk == new_sk)
+               return;
+            auto new_bytes = encode_secondary_key(prefix_view(), I + 1, new_sk);
+            auto existing =
+                _tx->template get<std::string>(detail::key_view_of(new_bytes));
+            if (existing &&
+                (existing->size() != new_pk_bytes.size() ||
+                 std::memcmp(existing->data(), new_pk_bytes.data(),
+                             new_pk_bytes.size()) != 0))
+            {
+               throw secondary_collision(
+                   "psitri_multiindex: ordered_unique secondary key "
+                   "would collide with a different primary on update");
+            }
+         }
+      }
+
+      // ── Apply (writes; called only after validation passes) ──────────
+
+      template <typename Row, std::size_t... Is>
+      void apply_all_secondaries(const Row&               row,
+                                 const std::vector<char>& pk_bytes,
+                                 std::index_sequence<Is...>)
+      {
+         (apply_one_insert<Is>(row, pk_bytes), ...);
+      }
+
+      template <std::size_t I, typename Row>
+      void apply_one_insert(const Row&               row,
+                            const std::vector<char>& pk_bytes)
+      {
+         auto [one_based, sk_bytes] = encode_secondary_for_row<I>(row);
+         (void)one_based;
          _tx->upsert(detail::key_view_of(sk_bytes),
                      detail::value_view_of(pk_bytes));
       }
 
-      // Erase all secondaries for a row whose existence we've already
-      // verified.  Pre-condition: the row's secondary entries point at this pk.
+      template <std::size_t... Is>
+      void apply_secondaries_diff(const T&                 old_row,
+                                  const T&                 new_row,
+                                  const std::vector<char>& new_pk_bytes,
+                                  std::index_sequence<Is...>)
+      {
+         (apply_one_diff<Is>(old_row, new_row, new_pk_bytes), ...);
+      }
+
+      template <std::size_t I>
+      void apply_one_diff(const T&                 old_row,
+                          const T&                 new_row,
+                          const std::vector<char>& new_pk_bytes)
+      {
+         using Idx = detail::nth_index_t<I, Secondaries...>;
+         auto old_sk = extract_secondary_key<Idx>(old_row);
+         auto new_sk = extract_secondary_key<Idx>(new_row);
+         if (old_sk == new_sk)
+            return;
+         auto old_bytes = encode_secondary_key(prefix_view(), I + 1, old_sk);
+         _tx->remove(detail::key_view_of(old_bytes));
+         auto new_bytes = encode_secondary_key(prefix_view(), I + 1, new_sk);
+         _tx->upsert(detail::key_view_of(new_bytes),
+                     detail::value_view_of(new_pk_bytes));
+      }
+
+      // ── Erase helpers (read row; remove secondaries) ─────────────────
+
       template <typename View, typename PK, std::size_t... Is>
       void erase_all_secondaries(const View& v, const PK& pk_value,
                                  std::index_sequence<Is...>)
       {
-         // For erase we need the actual stored secondary keys; decode the
-         // row once and reuse for all Is.
          T row = psio::decode<T>(psio::pssz{}, psio::bytes(v));
          (void)pk_value;
          (erase_one_secondary<Is>(row), ...);
@@ -799,67 +1123,6 @@ namespace psitri_multiindex
          auto [one_based, sk_bytes] = encode_secondary_for_row<I>(row);
          (void)one_based;
          _tx->remove(detail::key_view_of(sk_bytes));
-      }
-
-      // Diff-replace all secondaries given the existing row's view and the
-      // new in-hand row.
-      template <typename View, std::size_t... Is>
-      void replace_secondaries_diff(const View&              old_view,
-                                    const T&                 new_row,
-                                    const std::vector<char>& new_pk_bytes,
-                                    std::index_sequence<Is...>)
-      {
-         T old_row = psio::decode<T>(psio::pssz{}, psio::bytes(old_view));
-         (diff_one_secondary<Is>(old_row, new_row, new_pk_bytes), ...);
-      }
-
-      template <std::size_t I>
-      void diff_one_secondary(const T&                 old_row,
-                              const T&                 new_row,
-                              const std::vector<char>& new_pk_bytes)
-      {
-         using Idx                = detail::nth_index_t<I, Secondaries...>;
-         constexpr std::size_t one = I + 1;
-
-         auto old_sk_value = extract_secondary_key<Idx>(old_row);
-         auto new_sk_value = extract_secondary_key<Idx>(new_row);
-         if (old_sk_value == new_sk_value)
-            return;  // unchanged — no work
-
-         // Remove the old entry.
-         auto old_bytes =
-             encode_secondary_key(prefix_view(), one, old_sk_value);
-         _tx->remove(detail::key_view_of(old_bytes));
-
-         // Add the new entry, with collision check for unique indexes.
-         if constexpr (Idx::is_unique)
-         {
-            auto new_bytes =
-                encode_secondary_key(prefix_view(), one, new_sk_value);
-            auto existing =
-                _tx->template get<std::string>(detail::key_view_of(new_bytes));
-            if (existing)
-            {
-               const auto& bytes = *existing;
-               if (bytes.size() != new_pk_bytes.size() ||
-                   std::memcmp(bytes.data(), new_pk_bytes.data(),
-                               new_pk_bytes.size()) != 0)
-               {
-                  throw secondary_collision(
-                      "psitri_multiindex: ordered_unique secondary key "
-                      "would collide with a different primary on update");
-               }
-            }
-            _tx->upsert(detail::key_view_of(new_bytes),
-                        detail::value_view_of(new_pk_bytes));
-         }
-         else
-         {
-            auto new_bytes =
-                encode_secondary_key(prefix_view(), one, new_sk_value);
-            _tx->upsert(detail::key_view_of(new_bytes),
-                        detail::value_view_of(new_pk_bytes));
-         }
       }
 
       // ── Header storage ────────────────────────────────────────────────

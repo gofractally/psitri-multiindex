@@ -176,6 +176,42 @@ TEST_CASE("iter: zero-copy view via value_pin",
    tx.commit();
 }
 
+TEST_CASE("iter: seek re-positions an existing iterator", "[table][iter][seek]")
+{
+   fixture    f;
+   auto       tx = f.ws->start_transaction(0);
+   rows_table rows(tx, "R/");
+
+   for (std::uint64_t k : {std::uint64_t{10}, std::uint64_t{20}, std::uint64_t{30},
+                           std::uint64_t{40}, std::uint64_t{50}})
+      rows.put(PmidxIterRow{k, "v" + std::to_string(k)});
+
+   auto it = rows.begin();
+   REQUIRE(it != rows.end());
+   REQUIRE((*it).id == 10);
+
+   // Re-seek forward.
+   it.seek(std::uint64_t{30});
+   REQUIRE(it != rows.end());
+   REQUIRE((*it).id == 30);
+
+   // Re-seek backward.
+   it.seek(std::uint64_t{15});
+   REQUIRE(it != rows.end());
+   REQUIRE((*it).id == 20);
+
+   // Re-seek past last.
+   it.seek(std::uint64_t{99});
+   REQUIRE(it == rows.end());
+
+   // Re-seek back into range from end.
+   it.seek(std::uint64_t{40});
+   REQUIRE(it != rows.end());
+   REQUIRE((*it).id == 40);
+
+   tx.commit();
+}
+
 TEST_CASE("iter: stops at table prefix boundary", "[table][iter][isolation]")
 {
    fixture    f;

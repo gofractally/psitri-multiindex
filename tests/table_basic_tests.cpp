@@ -172,3 +172,83 @@ TEST_CASE("table: find<by_id> is the primary lookup",
 
    tx.commit();
 }
+
+TEST_CASE("table: clear() wipes every row + isolates from neighbour tables",
+          "[table][basic][clear]")
+{
+   test_db t;
+   auto    tx = t.ws->start_transaction(0);
+   accounts_table table_a(tx, "A/");
+   accounts_table table_b(tx, "B/");
+
+   for (std::uint64_t k = 1; k <= 5; ++k)
+   {
+      table_a.put(PmidxAccount{k, "a" + std::to_string(k), k, ""});
+      table_b.put(PmidxAccount{k, "b" + std::to_string(k), k, ""});
+   }
+
+   table_a.clear();
+
+   for (std::uint64_t k = 1; k <= 5; ++k)
+      REQUIRE_FALSE(table_a.contains(k));
+   REQUIRE(table_a.begin() == table_a.end());
+
+   // Sibling table B is untouched.
+   for (std::uint64_t k = 1; k <= 5; ++k)
+   {
+      auto v = table_b.get(k);
+      REQUIRE(v.has_value());
+      REQUIRE(v->name == "b" + std::to_string(k));
+   }
+
+   tx.commit();
+}
+
+TEST_CASE("table: clear() preserves track_row_count and resets count to 0",
+          "[table][basic][clear][row_count]")
+{
+   test_db        t;
+   auto           tx = t.ws->start_transaction(0);
+   accounts_table accounts(tx, "acc/", table_options{.track_row_count = true});
+
+   accounts.put(PmidxAccount{1, "a", 1, ""});
+   accounts.put(PmidxAccount{2, "b", 2, ""});
+   REQUIRE(accounts.size().value() == 2);
+
+   accounts.clear();
+   REQUIRE(accounts.size().has_value());
+   REQUIRE(accounts.size().value() == 0);
+
+   accounts.put(PmidxAccount{3, "c", 3, ""});
+   REQUIRE(accounts.size().value() == 1);
+
+   tx.commit();
+}
+
+TEST_CASE("table: erase_range erases [lo, hi) on the primary tree",
+          "[table][basic][erase_range]")
+{
+   test_db        t;
+   auto           tx = t.ws->start_transaction(0);
+   accounts_table accounts(tx, "acc/", table_options{.track_row_count = true});
+
+   for (std::uint64_t k = 1; k <= 10; ++k)
+      accounts.put(PmidxAccount{k, "u" + std::to_string(k), k, ""});
+   REQUIRE(accounts.size().value() == 10);
+
+   const auto erased = accounts.erase_range(std::uint64_t{3}, std::uint64_t{7});
+   REQUIRE(erased == 4);  // pks 3, 4, 5, 6
+
+   for (std::uint64_t k = 1; k <= 10; ++k)
+   {
+      const bool should_exist = (k < 3) || (k >= 7);
+      REQUIRE(accounts.contains(k) == should_exist);
+   }
+   REQUIRE(accounts.size().value() == 6);
+
+   // No-op range.
+   REQUIRE(accounts.erase_range(std::uint64_t{50}, std::uint64_t{60}) == 0);
+   REQUIRE(accounts.size().value() == 6);
+
+   tx.commit();
+}
