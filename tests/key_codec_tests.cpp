@@ -108,6 +108,47 @@ TEST_CASE("primary keys with composite components remain sortable",
    REQUIRE(memcmp_view(a, b) < 0);
 }
 
+TEST_CASE("composite tuple<string,string> components don't collide",
+          "[key_codec][composite][delimiter]")
+{
+   // psio::key terminates strings with the byte sequence \0\0 (with an
+   // \0\1 escape for embedded NULs). That terminator is what lets us
+   // concatenate variable-length string components in a tuple without
+   // losing the boundary — these two tuples MUST encode to distinct keys
+   // even though their concatenated raw character content is identical.
+   const std::string_view prefix = "T/";
+   auto k1 = encode_primary_key(prefix,
+                                std::make_tuple(std::string("a"),
+                                                std::string("bc")));
+   auto k2 = encode_primary_key(prefix,
+                                std::make_tuple(std::string("ab"),
+                                                std::string("c")));
+   REQUIRE(memcmp_view(k1, k2) != 0);
+
+   // Same trick, with an embedded NUL that exercises the \0\1 escape.
+   auto k3 = encode_primary_key(prefix,
+                                std::make_tuple(std::string("a"),
+                                                std::string(1, '\0')));
+   auto k4 = encode_primary_key(prefix,
+                                std::make_tuple(std::string("a\0", 2),
+                                                std::string("")));
+   REQUIRE(memcmp_view(k3, k4) != 0);
+}
+
+TEST_CASE("composite tuple<string,uint> sort order is lex-by-component",
+          "[key_codec][composite][sort]")
+{
+   const std::string_view prefix = "T/";
+   auto a = encode_primary_key(
+       prefix, std::make_tuple(std::string("alice"), std::uint64_t{1}));
+   auto b = encode_primary_key(
+       prefix, std::make_tuple(std::string("alice"), std::uint64_t{2}));
+   auto c = encode_primary_key(
+       prefix, std::make_tuple(std::string("bob"),   std::uint64_t{0}));
+   REQUIRE(memcmp_view(a, b) < 0);  // same name, smaller pk first
+   REQUIRE(memcmp_view(b, c) < 0);  // alice ranks before bob
+}
+
 TEST_CASE("encode_index_prefix returns just prefix ‖ index_byte",
           "[key_codec][prefix-iter]")
 {

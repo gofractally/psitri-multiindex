@@ -212,6 +212,38 @@ TEST_CASE("iter: seek re-positions an existing iterator", "[table][iter][seek]")
    tx.commit();
 }
 
+TEST_CASE("iter: pin keeps captured views readable after the iterator advances",
+          "[table][iter][zero-copy][pin]")
+{
+   fixture    f;
+   auto       tx = f.ws->start_transaction(0);
+   rows_table rows(tx, "R/");
+
+   for (std::uint64_t k = 1; k <= 5; ++k)
+      rows.put(PmidxIterRow{k, "row_" + std::to_string(k)});
+
+   // Pin once, capture every row's view during the walk, then check each
+   // captured view AFTER iteration has finished. This exercises the
+   // contract that pin holds the segments mapped — the bytes the views
+   // point at must still be readable as long as no mutation has happened
+   // and the pin is alive.
+   //
+   // value_pin is non-movable, so the pin lives as a local; the captured
+   // views live in a vector alongside it.
+   auto pin = rows.pin_values();
+
+   using view_t = rows_table::primary_iterator::value_view;
+   std::vector<view_t> views;
+   for (auto it = rows.begin(); it != rows.end(); ++it)
+      views.push_back(it.view(pin));
+
+   REQUIRE(views.size() == 5);
+   for (std::size_t i = 0; i < views.size(); ++i)
+      REQUIRE(views[i].template get<0>() == i + 1);
+
+   tx.commit();
+}
+
 TEST_CASE("iter: stops at table prefix boundary", "[table][iter][isolation]")
 {
    fixture    f;

@@ -8,47 +8,19 @@ commit in the relevant doc / changelog instead of leaving a "[done]" stub.
 
 ## Known bugs / sharp edges
 
-- **Mid-`put` exception leaves partial secondary state.** When the second
-  (or later) secondary's `secondary_collision` check throws, the primary
-  row and any earlier secondaries are already written. The enclosing
-  transaction unwinds correctly only if the caller aborts the (sub-)tx;
-  if they catch the exception and commit, the table is left inconsistent.
-  Fix options: (a) pre-validate every secondary before any write, (b)
-  document "always wrap multi-index writes in a sub-tx," (c) rewrite
-  `put` to itself open an internal sub-tx. (a) is cheapest for the common
-  no-collision case.
-- **`pin_values()` invalidation is silent.** A `value_pin` holds a
-  segment read-lock; mutating ops on the same `psitri::transaction` may
-  cause the pinned bytes to be rewritten under the reader. Today the
-  test suite never crosses pin-then-write, so the failure mode is
-  unproven. Add a test that documents the expected behavior (probably:
-  "pinned views are valid until the next mutating call on this tx") and
-  guard with an assertion in debug builds.
-- **`insert(row)` extractor constraint is unfriendly.** `insert` requires
-  `Primary::extractor` to be a member-object pointer (so it can write
-  the new id back into the row). Using `composite_key<...>` or a
-  member-fn pointer triggers a SFINAE failure with no message. Add a
-  `static_assert` at the top of `insert()` with a clear diagnostic.
+- **`pin_values()` debug-assert.** The positive contract is now
+  documented (`tests/table_iteration_tests.cpp` "pin keeps captured
+  views readable…"): pin-derived views stay valid as long as no
+  mutation happens on the underlying tx. The negative case (mutate-then-
+  read-pinned) is intentionally untested per psitri's stated contract
+  ("not a snapshot, does not make cursors valid across mutation"). Add
+  a debug-build assertion that fires when a cursor advance is followed
+  by a use-after-mutate of a pinned view from the same iteration.
 
 ## Correctness gaps
 
 - **`schema_hash` is a placeholder.** Field is reserved + reflected but
   always zero. Wire it once schema-validation modes ship (next section).
-- **No `clear()` / `erase_range(lo, hi)` / `drop()`.** Single-pk `erase`
-  only. Wiping a whole table on test teardown forces an iterator + N
-  deletes today. `clear()` should be a single `psitri::transaction`
-  prefix-erase.
-- **`find<Tag>` for non-unique returns first only.** Documented, but
-  awkward — unique and non-unique tags share a name with different
-  return semantics. Decision needed: rename non-unique to `find_first`,
-  or drop it for non-unique and force callers to `equal_range`.
-- **Composite-key delimiter uncertainty.** `std::tuple<A, B, ...>` is
-  encoded by concatenating each element's `psio::key` bytes. For
-  fixed-width elements this is collision-free; for variable-width
-  elements (e.g. `string`) it depends on the v3 `psio::key` encoding
-  including a self-delimiting marker. Verify against `psio::key`'s
-  `string` encoding and add a regression test for `tuple<string, ...>`
-  collisions.
 
 ## Schema validation (unblocked — xxhash now vendored)
 
@@ -67,19 +39,10 @@ commit in the relevant doc / changelog instead of leaving a "[done]" stub.
 
 ## API surface
 
-- `begin<Tag>()` / `end<Tag>()` — iterate in secondary-key order.
-- `lower_bound<Tag>(k)` / `upper_bound<Tag>(k)` — symmetry with the
-  primary versions.
-- `equal_range<Tag>(k)` for **unique** secondaries — currently throws a
-  `static_assert`. Returning a 0-or-1 element range is a cleaner
-  uniform API.
-- `count<Tag>(k)` — non-unique block size. Linear, but useful.
-- `modify(pk, λ)` — read-mutate-write helper. Avoids the manual
-  `auto v = get(pk); v->x = ...; put(*v);` round-trip and gives us
-  a single point to add the in-place fast path (see next section).
-- `iterator::seek(k)` — re-position an existing iterator without
-  constructing a fresh cursor.
-- `contains<Tag>(k)` — symmetry with the primary `contains(pk)`.
+- `iterator::seek(k)` exists for the primary iterator only. The
+  secondary `secondary_iterator<Tag>` would benefit from an analogous
+  `seek(k)` for re-positioning within a tag without constructing a
+  fresh cursor.
 
 ## Performance / fast paths
 
