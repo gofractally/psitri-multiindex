@@ -196,10 +196,13 @@ work as-is when ported:
 
 Gaps blocked on psio upstream:
 - **Digest-as-key** (`fc::sha256`, `transaction_id_type`, `digest_type`,
-  `block_id_type`). `psio::key` doesn't currently dispatch on
-  `std::array<uint8_t, N>`. Workarounds: reflect the digest as a
-  record of two `psio::uint128` halves, or as four `uint64`. Pending
-  proper support upstream.
+  `block_id_type`). Now supported via the
+  `sortable_binary_category` adapter slot — register a
+  `PSIO_ADAPTER(MyDigest, psio::sortable_binary_category, MyCodec)`
+  that emits the digest's raw bytes; psio::key consults the adapter
+  for both encoding and ordering. See
+  `tests/antelope_shapes_tests.cpp` "transaction_multi_index — by_trx_id
+  on a 32-byte digest".
 - **`long double` / `float128_t`** sort. `psio::key` handles `float`
   and `double` via sign-flipped big-endian (matches IEEE 754 less-than
   on finite values, including the NaN / signed-zero subtleties Spring's

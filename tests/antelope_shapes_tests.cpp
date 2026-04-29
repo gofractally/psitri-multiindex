@@ -5,10 +5,9 @@
 //   - auto-id primary + composite secondary of 2-3 `name` components
 //   - auto-id primary + composite secondary `(uint128, uint64)`
 //   - auto-id primary + double secondary (IEEE 754 sort-by-key bytes)
-//
-// What's NOT covered yet (psio upstream gap, tracked in TODO.md):
-//   - 32-byte digest types (fc::sha256 / transaction_id_type) as keys;
-//     std::array<uint8_t, 32> isn't in psio::key's encode_value dispatch.
+//   - auto-id primary + 32-byte digest secondary, encoded via a
+//     `sortable_binary_category` adapter (the path Antelope's
+//     fc::sha256 / transaction_id_type / digest_type travels through)
 
 #include <catch2/catch_all.hpp>
 
@@ -88,6 +87,55 @@ struct PmidxIndexDouble
 };
 PSIO_REFLECT(PmidxIndexDouble, id, secondary_key)
 
+// fc::sha256 / transaction_id_type stand-in: 32 raw bytes, treated as
+// memcmp-sortable via a sortable_binary_category adapter. Fixed-width,
+// so the wire and sort encodings coincide and we register the same
+// codec in both slots — that's what would let the same digest type be
+// embedded in both a pSSZ row body AND a sort key.
+struct PmidxDigest
+{
+   std::array<std::uint8_t, 32> bytes{};
+   bool operator==(const PmidxDigest&) const = default;
+   auto operator<=>(const PmidxDigest&) const = default;
+};
+
+struct pmidx_digest_codec
+{
+   static std::size_t packsize(const PmidxDigest&) noexcept { return 32; }
+   static void encode(const PmidxDigest& d, std::vector<char>& s)
+   {
+      s.insert(s.end(), reinterpret_cast<const char*>(d.bytes.data()),
+               reinterpret_cast<const char*>(d.bytes.data()) + 32);
+   }
+   static PmidxDigest decode(std::span<const char> b) noexcept
+   {
+      PmidxDigest d;
+      std::memcpy(d.bytes.data(), b.data(), 32);
+      return d;
+   }
+   static psio::codec_status validate(std::span<const char> b) noexcept
+   {
+      return b.size() < 32
+                 ? psio::codec_fail("PmidxDigest: short buffer", 0, "digest")
+                 : psio::codec_ok();
+   }
+   static psio::codec_status validate_strict(std::span<const char> b) noexcept
+   {
+      return validate(b);
+   }
+};
+
+PSIO_ADAPTER(PmidxDigest, psio::binary_category,          pmidx_digest_codec)
+PSIO_ADAPTER(PmidxDigest, psio::sortable_binary_category, pmidx_digest_codec)
+
+// transaction_multi_index pattern: pk + by_trx_id (32-byte digest).
+struct PmidxTransaction
+{
+   std::uint64_t id;
+   PmidxDigest   trx_id;
+};
+PSIO_REFLECT(PmidxTransaction, id, trx_id)
+
 namespace antelope_shapes
 {
    struct by_id;
@@ -97,6 +145,7 @@ namespace antelope_shapes
    struct by_code_scope_table;
    struct by_sender_id;
    struct by_secondary;
+   struct by_trx_id;
 
    struct fixture
    {
@@ -126,6 +175,7 @@ using antelope_shapes::by_owner;
 using antelope_shapes::by_parent_id;
 using antelope_shapes::by_secondary;
 using antelope_shapes::by_sender_id;
+using antelope_shapes::by_trx_id;
 using antelope_shapes::fixture;
 
 // ── account_index ────────────────────────────────────────────────────────
@@ -339,6 +389,62 @@ TEST_CASE("antelope: index_double — by_secondary sorts IEEE 754 doubles",
    auto it = t.lower_bound<by_secondary>(0.0);
    REQUIRE(it != t.end<by_secondary>());
    REQUIRE((*it).secondary_key == 0.0);
+
+   tx.commit();
+}
+
+// ── transaction_multi_index — by_trx_id on a 32-byte digest ──────────────
+//
+// The digest type is non-reflected; psio::key dispatches into its
+// `sortable_binary_category` adapter for both encoding and ordering.
+// This is the path Antelope's fc::sha256 / transaction_id_type land on.
+
+TEST_CASE("antelope: transaction_multi_index — by_trx_id on a 32-byte digest",
+          "[antelope][transaction][digest]")
+{
+   using trxs = table<
+       PmidxTransaction,
+       ordered_unique<by_id,     &PmidxTransaction::id>,
+       ordered_unique<by_trx_id, &PmidxTransaction::trx_id>>;
+
+   fixture f;
+   auto    tx = f.ws->start_transaction(0);
+   trxs    t(tx, "trx/");
+
+   PmidxDigest d_a{}, d_b{}, d_c{};
+   d_a.bytes[0]  = 0x10;
+   d_b.bytes[0]  = 0x20;
+   d_c.bytes[31] = 0xFF;  // sorts after d_a, d_b (first byte is zero)
+
+   t.insert(PmidxTransaction{0, d_b});
+   t.insert(PmidxTransaction{0, d_a});
+   t.insert(PmidxTransaction{0, d_c});
+
+   // Tag walk: d_c (0x00..FF) < d_a (0x10..) < d_b (0x20..) in
+   // memcmp order over 32 bytes — first byte differs only for a, b;
+   // c starts with 0x00 so sorts first.
+   std::vector<std::uint64_t> ids;
+   for (auto it = t.begin<by_trx_id>(); it != t.end<by_trx_id>(); ++it)
+      ids.push_back((*it).id);
+   REQUIRE(ids.size() == 3);
+   // The order is by digest bytes lexicographically.
+   auto trxs_in_order =
+       std::vector<PmidxDigest>{d_c, d_a, d_b};
+   for (std::size_t i = 0; i < ids.size(); ++i)
+   {
+      auto v = t.get(ids[i]);
+      REQUIRE(v.has_value());
+      REQUIRE(v->trx_id == trxs_in_order[i]);
+   }
+
+   // Exact digest lookup.
+   auto v = t.find<by_trx_id>(d_a);
+   REQUIRE(v.has_value());
+   REQUIRE(v->trx_id == d_a);
+
+   // Collision: same digest at a different pk — must throw.
+   REQUIRE_THROWS_AS(t.insert(PmidxTransaction{0, d_a}),
+                     psitri_multiindex::secondary_collision);
 
    tx.commit();
 }
