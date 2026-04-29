@@ -100,11 +100,10 @@ namespace psitri_multiindex
       std::optional<std::uint64_t> row_count{};      // present iff (flags & 1)
    };
 
+   PSIO_REFLECT(table_header, next_id, schema_hash, schema_version, flags, row_count)
+
    // Flag bits.
    inline constexpr std::uint16_t TABLE_FLAG_ROW_COUNT_ENABLED = 0x0001;
-
-   PSIO_REFLECT(table_header,
-                next_id, schema_hash, schema_version, flags, row_count)
 
    // Construction options.
    struct table_options
@@ -897,3 +896,13 @@ namespace psitri_multiindex
       bool                 _track_row_count = false;
    };
 }  // namespace psitri_multiindex
+
+// Bounds annotations let pSSZ pick the tightest offset / slot-table widths
+// for the header. We allow up to 8 declared fields (3 spare for future
+// trailing optionals) and cap the dynamic region at 32 bytes — the only
+// dynamic field today is `optional<uint64_t> row_count`, which fits in
+// 9 bytes worst case. Attached at file scope (rather than inline in
+// PSIO_REFLECT) because the `psio::annotate<…>` partial specialization
+// must live in a namespace enclosing `psio`.
+PSIO_TYPE_ATTRS(psitri_multiindex::table_header,
+                psio::max_fields_spec{8} | psio::max_dynamic_data_spec{32})
