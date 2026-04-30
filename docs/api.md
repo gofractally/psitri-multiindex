@@ -57,9 +57,53 @@ my_table t(tx, "T/", psitri_multiindex::table_options{...});
 - `table_options::track_row_count` (default `false`): opt-in row
   counter in the table header. Adds one header read+write per
   insert/erase that changes the count.
+- `table_options::schema` (default = strict, version 0): see §2.1.
 
 The constructor reads the header once. If `track_row_count` is on and
 the persisted header doesn't have it, the flag is stamped immediately.
+
+### 2.1 Schema validation
+
+`schema_options` (a member of `table_options`) controls how the
+constructor reconciles the runtime row type `T` with whatever was
+persisted at this table prefix.
+
+```cpp
+struct schema_options {
+   schema_mode   mode          = schema_mode::strict;
+   std::uint16_t version       = 0;
+   bool          allow_forward = false;
+};
+enum class schema_mode { strict, lenient, overwrite };
+```
+
+The runtime computes a structural fingerprint (`xxh64` over the
+recursively-walked reflection metadata) and stamps it into the table
+header on first write. On every subsequent re-open the constructor
+compares the persisted hash + version against the runtime's:
+
+| Situation | Behavior |
+|---|---|
+| Fresh table | Stamp `schema_hash` + `schema_version` from the runtime. |
+| Same hash, same version | Pass-through. |
+| Different hash, mode = `strict` | Throw `schema_mismatch`. |
+| Different hash, mode = `lenient` | Pass-through (caller has accepted the drift). |
+| Different hash, mode = `overwrite` | Re-stamp the header with the runtime's hash + version. Existing rows may no longer round-trip; the schema author has explicitly accepted that. |
+| Persisted version > runtime version, `allow_forward = false` | Throw `schema_mismatch`. (Independent of `mode` — refusing to read data written by a newer schema is a safety net, not a hash claim.) |
+| Persisted version > runtime version, `allow_forward = true` | Pass-through. |
+
+`schema_mismatch` carries `expected_hash`, `found_hash`,
+`expected_version`, and `found_version` so callers can decide whether
+to retry with a different mode.
+
+Fingerprint coverage:
+- Reflected types (`PSIO_REFLECT`'d) recurse — catches member rename /
+  reorder / type change inside nested structs.
+- Types with a `psio::get_type_name` overload (primitives, `std::string`,
+  `std::vector`, `std::array`, `std::optional`, `std::tuple`, plus any
+  `PSIO_REFLECT_TYPENAME(T)` registrations) use their spelled name.
+- Anonymous types fall back to `anon{<sizeof>:<alignof>}` — stable but
+  coarse; promote to `PSIO_REFLECT_TYPENAME` for better discrimination.
 
 ## 3. Mutations
 
@@ -141,8 +185,9 @@ The header is pSSZ-encoded with `maxFields(8)` + `maxDynamicData(32)`
 bounds — append-optional fields can be added without breaking older
 readers.
 
-`schema_hash` is currently a placeholder zero. Schema validation modes
-(strict / lenient / migrate / overwrite) are tracked in `TODO.md`.
+`schema_hash` is auto-computed from the row type T's reflection
+fingerprint and stamped on first write. See §2.1 for the validation
+modes the constructor offers on re-open.
 
 ## 7. Zero-copy reads via `value_pin`
 
@@ -171,6 +216,7 @@ For the documented invalidation rules straight from psitri, see
 | Type | When | Recovery |
 |---|---|---|
 | `psitri_multiindex::secondary_collision` | unique secondary check fails on `put`/`insert`/`modify` | nothing has been written; safe to catch and continue, or rethrow and abort the (sub-)tx |
+| `psitri_multiindex::schema_mismatch` | constructor sees a hash or forward-version mismatch (per `schema_options`) | open the same prefix in `lenient` or `overwrite` mode, or refuse to proceed |
 | `std::logic_error` | `modify` callback mutated the primary-key field | abort the tx — the row was rewritten before the post-check |
 | `std::invalid_argument` | `clear()` with an all-`0xff` prefix | use a non-saturated prefix |
 

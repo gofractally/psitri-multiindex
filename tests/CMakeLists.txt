@@ -15,6 +15,7 @@ add_executable(psitri_multiindex_tests
    table_iteration_tests.cpp
    table_subtx_tests.cpp
    table_header_tests.cpp
+   table_schema_tests.cpp
    antelope_shapes_tests.cpp)
 target_link_libraries(psitri_multiindex_tests
    PRIVATE

@@ -21,6 +21,7 @@
 //   auto by_grp  = tbl.equal_range<by_group>(100); // iteration range
 //   for (auto it = tbl.begin(); it != tbl.end(); ++it) ...   // primary order
 
+#include <psitri_multiindex/detail/schema_hash.hpp>
 #include <psitri_multiindex/key_codec.hpp>
 
 #include <psio/cpo.hpp>
@@ -85,6 +86,33 @@ namespace psitri_multiindex
       using std::runtime_error::runtime_error;
    };
 
+   // Thrown when the persisted schema_hash / schema_version doesn't match
+   // what the runtime expects (and `schema_options::mode` is `strict`),
+   // or when the persisted schema_version is newer than the runtime's
+   // expected version (and `allow_forward` is `false`). Callers can
+   // inspect the four fields to decide whether to override the table's
+   // mode (e.g. drop in `lenient` to read legacy data) or refuse to
+   // open at all.
+   class schema_mismatch : public std::runtime_error
+   {
+     public:
+      schema_mismatch(std::uint64_t expected_h, std::uint64_t found_h,
+                      std::uint16_t expected_v, std::uint16_t found_v,
+                      std::string   msg)
+          : std::runtime_error(std::move(msg)),
+            expected_hash(expected_h),
+            found_hash(found_h),
+            expected_version(expected_v),
+            found_version(found_v)
+      {
+      }
+
+      std::uint64_t expected_hash;
+      std::uint64_t found_hash;
+      std::uint16_t expected_version;
+      std::uint16_t found_version;
+   };
+
    // ── Table header ─────────────────────────────────────────────────────────
    //
    // Stored at `prefix ‖ 0x00 ‖ 0x00`, encoded with pSSZ. Trailing optional
@@ -105,10 +133,40 @@ namespace psitri_multiindex
    // Flag bits.
    inline constexpr std::uint16_t TABLE_FLAG_ROW_COUNT_ENABLED = 0x0001;
 
+   // Schema-validation policy at table-construction time.
+   //
+   //   strict    — throw `schema_mismatch` if the persisted
+   //               schema_hash differs from the runtime's expected
+   //               hash (default).
+   //   lenient   — accept the persisted hash even if it differs;
+   //               useful for transitional reads of legacy data.
+   //   overwrite — re-stamp the header with the runtime's hash; the
+   //               schema author has explicitly accepted that any
+   //               existing rows may no longer round-trip.
+   //
+   // Independently of `mode`, a stored `schema_version` strictly
+   // greater than `version` always throws unless `allow_forward` is
+   // true — a runtime should refuse to read data written by a newer
+   // schema it doesn't understand.
+   enum class schema_mode
+   {
+      strict,
+      lenient,
+      overwrite,
+   };
+
+   struct schema_options
+   {
+      schema_mode   mode          = schema_mode::strict;
+      std::uint16_t version       = 0;
+      bool          allow_forward = false;
+   };
+
    // Construction options.
    struct table_options
    {
-      bool track_row_count = false;
+      bool           track_row_count = false;
+      schema_options schema          = {};
    };
 
    namespace detail
@@ -221,21 +279,76 @@ namespace psitri_multiindex
             _prefix(base_prefix.begin(), base_prefix.end()),
             _track_row_count(opts.track_row_count)
       {
-         if (_track_row_count)
+         const auto expected_hash    = detail::compute_schema_hash<T>();
+         const auto expected_version = opts.schema.version;
+
+         auto persisted = read_header_raw();
+         if (!persisted.has_value())
          {
-            // Toggle the flag on; if the header doesn't exist yet, write
-            // it. If a row_count was never populated, leave it at 0 — the
-            // caller is responsible for either tracking from empty or
-            // doing a one-time scan to populate it.
-            auto h = read_header();
-            if (!(h.flags & TABLE_FLAG_ROW_COUNT_ENABLED))
+            // Fresh table — stamp the schema fields and (optionally)
+            // initialise row_count tracking.
+            table_header h{};
+            h.schema_hash    = expected_hash;
+            h.schema_version = expected_version;
+            if (_track_row_count)
             {
                h.flags |= TABLE_FLAG_ROW_COUNT_ENABLED;
-               if (!h.row_count.has_value())
-                  h.row_count = 0;
-               write_header(h);
+               h.row_count = 0;
+            }
+            write_header(h);
+            return;
+         }
+
+         table_header h    = *persisted;
+         bool         dirty = false;
+
+         // Forward-version check applies regardless of `mode` — refusing
+         // to read data written by a newer schema is a safety net, not a
+         // correctness assertion about hash compatibility.
+         if (h.schema_version > expected_version && !opts.schema.allow_forward)
+         {
+            throw schema_mismatch(
+                expected_hash, h.schema_hash, expected_version,
+                h.schema_version,
+                "psitri_multiindex: persisted schema_version is newer than "
+                "the runtime expects (set schema_options::allow_forward to "
+                "override)");
+         }
+
+         // Hash check — driven by mode.
+         if (h.schema_hash != expected_hash)
+         {
+            switch (opts.schema.mode)
+            {
+               case schema_mode::strict:
+                  throw schema_mismatch(
+                      expected_hash, h.schema_hash, expected_version,
+                      h.schema_version,
+                      "psitri_multiindex: schema_hash mismatch (set "
+                      "schema_options::mode to lenient or overwrite to "
+                      "proceed)");
+               case schema_mode::lenient:
+                  break;
+               case schema_mode::overwrite:
+                  h.schema_hash    = expected_hash;
+                  h.schema_version = expected_version;
+                  dirty            = true;
+                  break;
             }
          }
+
+         // Track-row-count opt-in: stamp the flag if it wasn't already.
+         if (_track_row_count &&
+             !(h.flags & TABLE_FLAG_ROW_COUNT_ENABLED))
+         {
+            h.flags |= TABLE_FLAG_ROW_COUNT_ENABLED;
+            if (!h.row_count.has_value())
+               h.row_count = 0;
+            dirty = true;
+         }
+
+         if (dirty)
+            write_header(h);
       }
 
       table(const table&)            = delete;
@@ -1184,6 +1297,20 @@ namespace psitri_multiindex
          auto raw = _tx->template get<std::string>(detail::key_view_of(k));
          if (!raw)
             return table_header{};
+         return psio::decode<table_header>(
+             psio::pssz{}, std::span<const char>(raw->data(), raw->size()));
+      }
+
+      // Returns nullopt when no header has ever been written for this
+      // table prefix. Distinguishes "fresh table" from "header decoded
+      // to a default-constructed value" — the constructor needs that
+      // distinction for the schema-stamp-on-first-write path.
+      std::optional<table_header> read_header_raw() const
+      {
+         auto k   = header_key();
+         auto raw = _tx->template get<std::string>(detail::key_view_of(k));
+         if (!raw)
+            return std::nullopt;
          return psio::decode<table_header>(
              psio::pssz{}, std::span<const char>(raw->data(), raw->size()));
       }

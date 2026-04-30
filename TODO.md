@@ -17,25 +17,30 @@ commit in the relevant doc / changelog instead of leaving a "[done]" stub.
   a debug-build assertion that fires when a cursor advance is followed
   by a use-after-mutate of a pinned view from the same iteration.
 
-## Correctness gaps
+## Schema validation — follow-ups
 
-- **`schema_hash` is a placeholder.** Field is reserved + reflected but
-  always zero. Wire it once schema-validation modes ship (next section).
+The core landed: `compute_schema_hash<T>()` walks reflection metadata
+recursively to fingerprint a row type, the `table` constructor stamps
+on fresh tables and validates on re-open, and `schema_options` exposes
+`strict` / `lenient` / `overwrite` modes plus a forward-version
+allowlist. Open follow-ups:
 
-## Schema validation (unblocked — xxhash now vendored)
-
-- Compute `xxh64(canonical-schema-bytes)` at table construction. Stamp
-  on first write; verify on subsequent opens.
-- `schema_options` enum: `strict` (throw on mismatch), `lenient` (log,
-  proceed), `migrate` (call user-supplied migration fn), `overwrite`
-  (re-stamp). Default = `strict`.
-- `schema_version` ladder: refuse to open when stored version >
-  runtime, unless `schema_options.allow_forward = true`.
-- Throw a typed `schema_mismatch` exception (parallel to
-  `secondary_collision`) carrying both stored + expected hashes.
-- Decision still open: hash the psio::schema IR (canonical, format-
-  independent) or the WIT/pSSZ wire bytes. The IR is more stable; the
-  wire bytes catch annotation drift that doesn't affect the IR.
+- **`migrate` mode.** A user-supplied callback that gets the persisted
+  header + the runtime's expected hash + a tx and is responsible for
+  re-encoding existing rows. Sketched out earlier; deferred because
+  the migration API needs the table itself for re-encoding, which
+  means a chicken-and-egg with the constructor-time validation.
+  Likely shape: `schema_options::migrate = std::function<void(
+  psitri::transaction&, std::string_view prefix,
+  const table_header& persisted, table_header& target)>`.
+- **Hash deeper.** Today the fingerprint walks reflected types
+  recursively but falls back to `get_type_name` (or `anon{size:align}`)
+  for non-reflected nested types. A future pass could hash type-level
+  annotations (`maxFields`, `maxDynamicData`, `definitionWillNotChange`,
+  `as_spec<Tag>`) so wire-format drift inside otherwise-identical
+  shapes is also caught. This is the "hash the psio::schema IR"
+  alternative we deferred — meaningful when we want round-trip
+  guarantees across tagged-binary / WIT / pSSZ formats.
 
 ## API surface
 
@@ -61,10 +66,6 @@ commit in the relevant doc / changelog instead of leaving a "[done]" stub.
 
 ## Build / packaging
 
-- **Vendored `detail/xxhash.h` not yet consumed.** When schema_hash
-  wiring lands, the single inclusion site needs `#define XXH_INLINE_ALL`
-  *before* the `#include` so xxhash compiles as header-only and we
-  don't need a `.c` translation unit.
 - **CI workflow.** No GitHub Actions yet. Matrix should be {linux/clang,
   linux/gcc, macos/homebrew-clang} × {C++23}. Run `psitri_multiindex_tests`
   + smoke. Target Catch2 from apt/brew rather than vendoring.
@@ -76,11 +77,10 @@ commit in the relevant doc / changelog instead of leaving a "[done]" stub.
 
 ## Docs
 
-- **Schema-validation guide.** Lands with the schema_hash work.
 - **Ordering rules deep-dive.** `psio::key` encoding semantics for the
   types we actually use (uints, strings, optional, tuple, float/double,
-  uint128/256). Big-endian-int policy. "What makes a key memcmp-
-  sortable" rules. Today scattered across `docs/api.md` §1 and
+  uint128/256, float128). Big-endian-int policy. "What makes a key
+  memcmp-sortable" rules. Today scattered across `docs/api.md` §1 and
   `tests/key_codec_tests.cpp`; gather into a single doc.
 
 ## Parking lot — open design questions
